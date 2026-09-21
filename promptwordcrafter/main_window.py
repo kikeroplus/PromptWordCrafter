@@ -561,21 +561,30 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("置換対象は見つかりませんでした。")
             return
 
-        new_text = old_text.replace(needle, replacement)
-        backup_path = self.current_path.with_suffix(self.current_path.suffix + ".bak")
+        # 編集欄を直接編集する（Ctrl+Z で元に戻せる。ファイルへは「保存」で反映）。
+        # 後ろの一致から置換して、前の一致の位置がずれないようにする
+        positions = []
+        position = 0
+        while True:
+            position = old_text.find(needle, position)
+            if position < 0:
+                break
+            positions.append(position)
+            position += len(needle)
 
-        try:
-            if not backup_path.exists():
-                shutil.copy2(self.current_path, backup_path)
-            self.current_path.write_text(new_text, encoding=self.current_encoding, newline="")
-        except OSError as exc:
-            QMessageBox.critical(self, "保存エラー", f"置換結果を保存できませんでした。\n\n{exc}")
-            return
+        cursor = QTextCursor(self.text_edit.document())
+        cursor.beginEditBlock()
+        for position in reversed(positions):
+            cursor.setPosition(position)
+            cursor.setPosition(position + len(needle), QTextCursor.MoveMode.KeepAnchor)
+            cursor.insertText(replacement)
+        cursor.endEditBlock()
 
-        self.text_edit.setPlainText(new_text)
-        self.text_edit.document().setModified(False)
+        self.text_edit.document().setModified(True)
         self.search_text()
-        self.statusBar().showMessage(f"置換完了: {count} 件を置換しました。バックアップ: {backup_path.name}")
+        self.statusBar().showMessage(
+            f"置換完了: {count} 件を置換しました（Ctrl+Zで元に戻せます）。内容を確認して保存してください。"
+        )
         self.scan_file_list_matches()
         self.file_list.setFocus()
 
