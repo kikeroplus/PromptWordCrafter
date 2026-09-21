@@ -58,12 +58,18 @@ _LINE_BREAK = "(?:" + "|".join([CR + LF, CR, LF, LINE_SEP, PARA_SEP]) + ")"
 _SPACE = "[ " + NBSP + "]"
 
 
+def normalize_needle(needle: str) -> str:
+    """検索語を編集欄（toPlainText）と同じ表記にそろえる（NBSP→空白、各種改行→LF）。"""
+    needle = needle.replace(CR + LF, LF).replace(CR, LF)
+    return needle.replace(LINE_SEP, LF).replace(PARA_SEP, LF).replace(NBSP, " ")
+
+
 def _build_pattern(needle: str) -> re.Pattern:
     """編集欄（toPlainText）と同じ揺れを許容する検索パターンを作る。
 
     空白は NBSP にも、改行は CRLF / CR / LF / U+2028 / U+2029 のどれにも一致する。
     """
-    needle = needle.replace(CR + LF, LF).replace(NBSP, " ")
+    needle = normalize_needle(needle)
     parts = []
     for ch in needle:
         if ch == " ":

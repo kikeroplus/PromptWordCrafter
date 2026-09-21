@@ -404,8 +404,11 @@ class MainWindow(QMainWindow):
         self.search_edit.setFocus()
 
     def editor_search_text(self) -> str:
-        """編集欄（toPlainText）と同じ正規化を検索語にも適用する（NBSP→空白）。"""
-        return self.search_edit.text().replace(" ", " ")
+        """編集欄（toPlainText）と同じ正規化を検索語にも適用する。
+
+        NBSP→空白、CRLF / 単独CR / U+2028 / U+2029→改行。
+        """
+        return bulk_ops.normalize_needle(self.search_edit.text())
 
     def clear_replace_text(self):
         self.replace_edit.clear()
