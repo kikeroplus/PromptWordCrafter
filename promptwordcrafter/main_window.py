@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFileSystemModel,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -32,7 +33,7 @@ from PySide6.QtWidgets import (
 from . import bulk_ops
 from . import settings as settings_module
 from . import text_io
-from .dialogs import AddTextDialog, RemoveTextDialog, RenameDialog
+from .dialogs import AddTextDialog, NewFileDialog, RemoveTextDialog, RenameDialog
 from .file_list import FileListWidget
 from .highlighter import TagHighlighter
 from .widgets import FolderTreeView, NewlineAwareLineEdit
@@ -96,31 +97,42 @@ class MainWindow(QMainWindow):
 
         # 検索・置換コントロールバー
         control_bar = QHBoxLayout()
-        control_bar.addWidget(QLabel("検索文字列"))
+
+        search_group = QGroupBox("検索")
+        search_layout = QHBoxLayout(search_group)
         self.search_edit = QLineEdit(self.settings_data.get("search", ""))
-        control_bar.addWidget(self.search_edit, 2)
+        search_layout.addWidget(self.search_edit, 1)
         self.search_button = QPushButton("検索")
-        control_bar.addWidget(self.search_button)
+        search_layout.addWidget(self.search_button)
         self.clear_button = QPushButton("クリア")
-        control_bar.addWidget(self.clear_button)
-
-        control_bar.addWidget(QLabel("置換文字列"))
-        self.replace_edit = NewlineAwareLineEdit(self.settings_data.get("replace", ""))
-        control_bar.addWidget(self.replace_edit, 2)
-        self.replace_button = QPushButton("置換")
-        control_bar.addWidget(self.replace_button)
-        self.folder_replace_button = QPushButton("フォルダ一括置換")
-        control_bar.addWidget(self.folder_replace_button)
-        self.save_button = QPushButton("保存")
-        control_bar.addWidget(self.save_button)
-
+        search_layout.addWidget(self.clear_button)
         self.count_label = QLabel("出現回数: 0")
-        control_bar.addWidget(self.count_label)
+        search_layout.addWidget(self.count_label)
+        control_bar.addWidget(search_group, 1)
+
+        replace_group = QGroupBox("置換")
+        replace_layout = QHBoxLayout(replace_group)
+        self.replace_edit = NewlineAwareLineEdit(self.settings_data.get("replace", ""))
+        replace_layout.addWidget(self.replace_edit, 1)
+        self.replace_clear_button = QPushButton("クリア")
+        replace_layout.addWidget(self.replace_clear_button)
+        self.replace_button = QPushButton("置換")
+        replace_layout.addWidget(self.replace_button)
+        self.folder_replace_button = QPushButton("フォルダ一括置換")
+        replace_layout.addWidget(self.folder_replace_button)
+        control_bar.addWidget(replace_group, 1)
+
+        file_buttons = QVBoxLayout()
+        self.save_button = QPushButton("保存")
+        file_buttons.addWidget(self.save_button)
+        self.new_file_button = QPushButton("新規ファイル")
+        file_buttons.addWidget(self.new_file_button)
+        control_bar.addLayout(file_buttons)
         root_layout.addLayout(control_bar)
 
-        # 一括操作バー
-        bulk_bar = QHBoxLayout()
-        bulk_bar.addWidget(QLabel("一括操作"))
+        # 一括操作グループ
+        bulk_group = QGroupBox("一括操作")
+        bulk_bar = QHBoxLayout(bulk_group)
         self.rename_button = QPushButton("一括リネーム")
         bulk_bar.addWidget(self.rename_button)
         self.add_text_button = QPushButton("文字列追加")
@@ -132,7 +144,7 @@ class MainWindow(QMainWindow):
         self.reformat_button = QPushButton("文字列成型")
         bulk_bar.addWidget(self.reformat_button)
         bulk_bar.addStretch(1)
-        root_layout.addLayout(bulk_bar)
+        root_layout.addWidget(bulk_group)
 
         # フォルダツリー + ファイル一覧 + プレビュー編集
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -190,6 +202,7 @@ class MainWindow(QMainWindow):
         self.search_button.clicked.connect(self.search_text)
         self.clear_button.clicked.connect(self.clear_search_text)
 
+        self.replace_clear_button.clicked.connect(self.clear_replace_text)
         self.replace_button.clicked.connect(self.replace_text)
         self.folder_replace_button.clicked.connect(self.replace_text_in_folder)
         self.save_button.clicked.connect(lambda: self.save_current_file())
@@ -197,6 +210,7 @@ class MainWindow(QMainWindow):
         self.file_list.currentItemChanged.connect(self.on_current_item_changed)
         self.text_edit.selectionChanged.connect(self.copy_selection_to_search)
 
+        self.new_file_button.clicked.connect(self.create_new_file)
         self.rename_button.clicked.connect(self.open_rename_dialog)
         self.add_text_button.clicked.connect(self.open_add_text_dialog)
         self.remove_text_button.clicked.connect(self.open_remove_text_dialog)
@@ -388,6 +402,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("検索文字列をクリアしました。")
         self.search_edit.setFocus()
 
+    def clear_replace_text(self):
+        self.replace_edit.clear()
+        self.statusBar().showMessage("置換文字列をクリアしました。")
+        self.replace_edit.setFocus()
+
     def search_text(self):
         needle = self.search_edit.text()
         self.clear_matches()
@@ -577,6 +596,41 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 一括操作
     # ------------------------------------------------------------------
+    def create_new_file(self):
+        folder = Path(self.folder_edit.text()).expanduser()
+        if not folder.is_dir():
+            QMessageBox.information(self, "新規ファイル", "有効なフォルダを選択してください。")
+            return
+
+        default_name = bulk_ops.suggest_new_file_name([path.name for path in self.files])
+        dialog = NewFileDialog(default_name, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        name = dialog.name()
+        if not name or any(ch in name for ch in '\\/:*?"<>|'):
+            QMessageBox.information(self, "新規ファイル", "ファイル名が正しくありません。")
+            return
+        if Path(name).suffix.lower() not in text_io.TEXT_EXTENSIONS:
+            name += ".txt"
+        if not self.confirm_save_changes():
+            return
+
+        try:
+            new_path = bulk_ops.create_empty_file(folder, name)
+        except FileExistsError:
+            QMessageBox.critical(self, "新規ファイル", f"{name} は既に存在します。")
+            return
+        except OSError as exc:
+            QMessageBox.critical(self, "新規ファイル", f"ファイルを作成できませんでした。\n\n{exc}")
+            return
+
+        self.load_folder(confirm=False)
+        if new_path in self.files:
+            self.file_list.setCurrentRow(self.files.index(new_path))
+        self.text_edit.setFocus()
+        self.statusBar().showMessage(f"{new_path.name} を作成しました。")
+
     def open_rename_dialog(self):
         selected_items = self.file_list.selectedItems()
         if len(selected_items) >= 2:

@@ -133,6 +133,31 @@ class AddTextDialog(QDialog):
         return self.text_input.toPlainText()
 
 
+class NewFileDialog(QDialog):
+    """新規テキストファイルの名前を入力するダイアログ。"""
+
+    def __init__(self, default_name: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("新規ファイル")
+        self.resize(420, 120)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("ファイル名（最後のファイル名+1 を初期表示）"))
+        self.name_edit = QLineEdit(default_name)
+        self.name_edit.selectAll()
+        layout.addWidget(self.name_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def name(self) -> str:
+        return self.name_edit.text().strip()
+
+
 class RemoveTextDialog(QDialog):
     """ファイルから指定文字列を削除するダイアログ。"""
 

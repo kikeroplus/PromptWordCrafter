@@ -1,5 +1,6 @@
 """フォルダ・複数ファイルに対する一括操作。"""
 
+import re
 import shutil
 from pathlib import Path
 
@@ -66,6 +67,40 @@ def replace_text_in_file(path: Path, needle: str, replacement: str) -> int:
     backup_if_needed(path)
     path.write_text(new_content, encoding=encoding, newline="")
     return count
+
+
+def suggest_new_file_name(existing_names: list[str]) -> str:
+    """一覧の最後のファイル名の末尾番号を +1 した名前を返す（桁数・拡張子は維持）。"""
+    taken = {name.lower() for name in existing_names}
+    if not existing_names:
+        candidate = "prompt_001.txt"
+        number = 1
+        while candidate.lower() in taken:
+            number += 1
+            candidate = f"prompt_{number:03d}.txt"
+        return candidate
+
+    last = Path(existing_names[-1])
+    match = re.match(r"^(.*?)(\d+)$", last.stem)
+    if match:
+        prefix, digits = match.group(1), match.group(2)
+        number = int(digits)
+        width = len(digits)
+    else:
+        prefix, number, width = f"{last.stem}_", 1, 1
+
+    while True:
+        number += 1
+        candidate = f"{prefix}{number:0{width}d}{last.suffix}"
+        if candidate.lower() not in taken:
+            return candidate
+
+
+def create_empty_file(folder: Path, name: str) -> Path:
+    path = folder / name
+    with path.open("x", encoding="utf-8"):
+        pass
+    return path
 
 
 def delete_bak_files(folder: Path) -> int:
