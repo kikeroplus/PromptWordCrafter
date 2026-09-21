@@ -47,33 +47,50 @@ def add_text_to_file(path: Path, text: str, position: str) -> None:
     path.write_text(new_content, encoding=encoding, newline="")
 
 
-def _match_newlines(text: str, content: str) -> str:
-    """検索語・置換語の改行(\\n)を、対象ファイルの改行コード(CRLF/LF)に合わせる。"""
-    if "\r\n" in content:
-        return text.replace("\r\n", "\n").replace("\n", "\r\n")
-    return text
+CR = chr(13)
+LF = chr(10)
+NBSP = chr(0xA0)
+LINE_SEP = chr(0x2028)
+PARA_SEP = chr(0x2029)
+
+# 編集欄（toPlainText）で改行として扱われるものすべてに一致する
+_LINE_BREAK = "(?:" + "|".join([CR + LF, CR, LF, LINE_SEP, PARA_SEP]) + ")"
+_SPACE = "[ " + NBSP + "]"
+
+
+def _build_pattern(needle: str) -> re.Pattern:
+    """編集欄（toPlainText）と同じ揺れを許容する検索パターンを作る。
+
+    空白は NBSP にも、改行は CRLF / CR / LF / U+2028 / U+2029 のどれにも一致する。
+    """
+    needle = needle.replace(CR + LF, LF).replace(NBSP, " ")
+    parts = []
+    for ch in needle:
+        if ch == " ":
+            parts.append(_SPACE)
+        elif ch == LF:
+            parts.append(_LINE_BREAK)
+        else:
+            parts.append(re.escape(ch))
+    return re.compile("".join(parts))
+
+
+def _replace_in_content(content: str, needle: str, replacement: str) -> tuple[str, int]:
+    pattern = _build_pattern(needle)
+    newline = CR + LF if (CR + LF) in content else LF
+    replacement = replacement.replace(CR + LF, LF).replace(LF, newline)
+    return pattern.subn(lambda _match: replacement, content)
 
 
 def remove_text_from_file(path: Path, needle: str) -> int:
-    content, encoding = text_io.read_text(path)
-    needle = _match_newlines(needle, content)
-    count = content.count(needle)
-    if count == 0:
-        return 0
-    new_content = content.replace(needle, "")
-    backup_if_needed(path)
-    path.write_text(new_content, encoding=encoding, newline="")
-    return count
+    return replace_text_in_file(path, needle, "")
 
 
 def replace_text_in_file(path: Path, needle: str, replacement: str) -> int:
     content, encoding = text_io.read_text(path)
-    needle = _match_newlines(needle, content)
-    replacement = _match_newlines(replacement, content)
-    count = content.count(needle)
+    new_content, count = _replace_in_content(content, needle, replacement)
     if count == 0:
         return 0
-    new_content = content.replace(needle, replacement)
     backup_if_needed(path)
     path.write_text(new_content, encoding=encoding, newline="")
     return count
