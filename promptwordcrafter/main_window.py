@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QDir, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QKeySequence, QShortcut, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QColor, QKeySequence, QShortcut, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -63,6 +63,7 @@ class MainWindow(QMainWindow):
         self._tree_root = None
         self._tree_selection_guard = False
         self._suppress_tree_scroll = False
+        self._scan_document = QTextDocument(self)
 
         self.scan_timer = QTimer(self)
         self.scan_timer.setSingleShot(True)
@@ -402,13 +403,17 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("検索文字列をクリアしました。")
         self.search_edit.setFocus()
 
+    def editor_search_text(self) -> str:
+        """編集欄（toPlainText）と同じ正規化を検索語にも適用する（NBSP→空白）。"""
+        return self.search_edit.text().replace(" ", " ")
+
     def clear_replace_text(self):
         self.replace_edit.clear()
         self.statusBar().showMessage("置換文字列をクリアしました。")
         self.replace_edit.setFocus()
 
     def search_text(self):
-        needle = self.search_edit.text()
+        needle = self.editor_search_text()
         self.clear_matches()
         if not needle:
             self.file_list.setFocus()
@@ -463,7 +468,7 @@ class MainWindow(QMainWindow):
         self.file_list.setFocus()
 
     def scan_file_list_matches(self):
-        needle = self.search_edit.text()
+        needle = self.editor_search_text()
         for i in range(self.file_list.count()):
             self.file_list.item(i).setBackground(QColor(Qt.GlobalColor.white))
 
@@ -476,7 +481,9 @@ class MainWindow(QMainWindow):
                     text = self.text_edit.toPlainText()
                 else:
                     text, _encoding = text_io.read_text(path)
-                    text = text.replace("\r\n", "\n")
+                    # 編集欄と同じ変換（NBSP→空白、U+2028/単独CR→改行など）を通して比較する
+                    self._scan_document.setPlainText(text)
+                    text = self._scan_document.toPlainText()
             except OSError:
                 continue
             if needle in text:
@@ -541,7 +548,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "置換", "置換するファイルを選択してください。")
             return
 
-        needle = self.search_edit.text()
+        needle = self.editor_search_text()
         replacement = self.replace_edit.text()
         if not needle:
             QMessageBox.information(self, "置換", "検索文字列を入力してください。")
