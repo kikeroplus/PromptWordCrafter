@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QDir, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QKeySequence, QShortcut, QTextCharFormat, QTextCursor, QTextDocument
+from PySide6.QtGui import QColor, QKeySequence, QShortcut, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -100,7 +100,7 @@ class MainWindow(QMainWindow):
 
         search_group = QGroupBox("検索")
         search_layout = QHBoxLayout(search_group)
-        self.search_edit = QLineEdit(self.settings_data.get("search", ""))
+        self.search_edit = NewlineAwareLineEdit(self.settings_data.get("search", ""))
         search_layout.addWidget(self.search_edit, 1)
         self.search_button = QPushButton("検索")
         search_layout.addWidget(self.search_button)
@@ -419,11 +419,20 @@ class MainWindow(QMainWindow):
         selections = []
         first_cursor = None
         count = 0
-        cursor = QTextCursor(document)
+        # QTextDocument.find は行（段落）をまたぐ検索ができないため、
+        # プレーンテキスト上で検索して文字位置をカーソルに変換する
+        # （toPlainText の各文字はカーソル位置と1対1に対応する）
+        plain_text = self.text_edit.toPlainText()
+        position = 0
         while True:
-            cursor = document.find(needle, cursor, QTextDocument.FindFlag.FindCaseSensitively)
-            if cursor.isNull():
+            position = plain_text.find(needle, position)
+            if position < 0:
                 break
+            cursor = QTextCursor(document)
+            cursor.setPosition(position)
+            cursor.setPosition(position + len(needle), QTextCursor.MoveMode.KeepAnchor)
+            position += len(needle)
+
             match_selection = QTextEdit.ExtraSelection()
             match_selection.cursor = QTextCursor(cursor)
             match_format = QTextCharFormat()
@@ -467,6 +476,7 @@ class MainWindow(QMainWindow):
                     text = self.text_edit.toPlainText()
                 else:
                     text, _encoding = text_io.read_text(path)
+                    text = text.replace("\r\n", "\n")
             except OSError:
                 continue
             if needle in text:

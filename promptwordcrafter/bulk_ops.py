@@ -47,8 +47,16 @@ def add_text_to_file(path: Path, text: str, position: str) -> None:
     path.write_text(new_content, encoding=encoding, newline="")
 
 
+def _match_newlines(text: str, content: str) -> str:
+    """検索語・置換語の改行(\\n)を、対象ファイルの改行コード(CRLF/LF)に合わせる。"""
+    if "\r\n" in content:
+        return text.replace("\r\n", "\n").replace("\n", "\r\n")
+    return text
+
+
 def remove_text_from_file(path: Path, needle: str) -> int:
     content, encoding = text_io.read_text(path)
+    needle = _match_newlines(needle, content)
     count = content.count(needle)
     if count == 0:
         return 0
@@ -60,6 +68,8 @@ def remove_text_from_file(path: Path, needle: str) -> int:
 
 def replace_text_in_file(path: Path, needle: str, replacement: str) -> int:
     content, encoding = text_io.read_text(path)
+    needle = _match_newlines(needle, content)
+    replacement = _match_newlines(replacement, content)
     count = content.count(needle)
     if count == 0:
         return 0
