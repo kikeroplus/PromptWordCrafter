@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -31,11 +32,14 @@ from PySide6.QtWidgets import (
 )
 
 from . import bulk_ops
+from . import results
 from . import settings as settings_module
 from . import text_io
 from .dialogs import AddTextDialog, NewFileDialog, RemoveTextDialog, RenameDialog
 from .file_list import FileListWidget
+from .generation import GenerationController
 from .highlighter import TagHighlighter
+from .results_view import ResultsStrip
 from .widgets import FolderTreeView, NewlineAwareLineEdit
 
 FILE_MATCH_BACKGROUND = "#edf5ef"
@@ -68,6 +72,8 @@ class MainWindow(QMainWindow):
         self.scan_timer = QTimer(self)
         self.scan_timer.setSingleShot(True)
         self.scan_timer.timeout.connect(self.scan_file_list_matches)
+
+        self.generation = GenerationController(self, self.prompt_text_for, self.statusBar().showMessage)
 
         self._build_ui()
         self._restore_window_geometry()
@@ -145,7 +151,23 @@ class MainWindow(QMainWindow):
         self.reformat_button = QPushButton("文字列成型")
         bulk_bar.addWidget(self.reformat_button)
         bulk_bar.addStretch(1)
-        root_layout.addWidget(bulk_group)
+
+        # 生成 (ComfyUI) グループ: 生成する | 生成ジョブ | 生成の設定
+        generate_group = QGroupBox("生成 (ComfyUI)")
+        generate_bar = QHBoxLayout(generate_group)
+        self.generate_button = QPushButton("生成する")
+        self.generate_button.setToolTip("選択中のテキストファイルの本文をプロンプトにして、ComfyUI で生成します")
+        generate_bar.addWidget(self.generate_button)
+        self.jobs_button = QPushButton("生成ジョブ")
+        self.jobs_button.setToolTip("生成ジョブの一覧 (Ctrl+J)")
+        generate_bar.addWidget(self.jobs_button)
+        self.generate_settings_button = QPushButton("生成の設定")
+        generate_bar.addWidget(self.generate_settings_button)
+
+        tool_row = QHBoxLayout()
+        tool_row.addWidget(bulk_group, 1)
+        tool_row.addWidget(generate_group)
+        root_layout.addLayout(tool_row)
 
         # フォルダツリー + ファイル一覧 + プレビュー編集
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -168,12 +190,21 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.folder_tree)
 
         self.file_list = FileListWidget()
+        self.file_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         splitter.addWidget(self.file_list)
 
+        # 編集欄と、その下に「生成結果」(このテキストから生成した画像・動画)
+        editor_splitter = QSplitter(Qt.Orientation.Vertical)
         self.text_edit = QTextEdit()
         self.text_edit.setAcceptRichText(False)
         self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        splitter.addWidget(self.text_edit)
+        editor_splitter.addWidget(self.text_edit)
+        self.results_strip = ResultsStrip()
+        editor_splitter.addWidget(self.results_strip)
+        editor_splitter.setStretchFactor(0, 1)
+        editor_splitter.setStretchFactor(1, 0)
+        editor_splitter.setCollapsible(0, False)
+        splitter.addWidget(editor_splitter)
         self.tag_highlighter = TagHighlighter(self.text_edit.document())
 
         splitter.setStretchFactor(0, 1)
@@ -220,6 +251,16 @@ class MainWindow(QMainWindow):
 
         self.folder_tree.selectionModel().currentChanged.connect(self.on_tree_current_changed)
 
+        self.file_list.customContextMenuRequested.connect(self.show_file_menu)
+        self.generate_button.clicked.connect(self.generate_selected)
+        self.jobs_button.clicked.connect(self.generation.show_jobs)
+        self.generate_settings_button.clicked.connect(self.generation.show_settings)
+        self.generation.jobs_changed.connect(self.update_jobs_button)
+        self.generation.job_done.connect(self.on_generation_done)
+        self.results_strip.status.connect(self.statusBar().showMessage)
+        jobs_shortcut = QShortcut(QKeySequence("Ctrl+J"), self)
+        jobs_shortcut.activated.connect(self.generation.show_jobs)
+
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         save_shortcut.activated.connect(lambda: self.save_current_file())
 
@@ -240,7 +281,7 @@ class MainWindow(QMainWindow):
         settings_module.save_settings(data)
 
     def closeEvent(self, event):
-        if not self.confirm_save_changes():
+        if not self.confirm_save_changes() or not self.generation.confirm_close():
             event.ignore()
             return
         self.save_settings()
@@ -272,10 +313,12 @@ class MainWindow(QMainWindow):
         self.text_edit.clear()
         self.text_edit.document().setModified(False)
         self.current_path = None
+        self.results_strip.clear()
         self.count_label.setText("出現回数: 0")
 
         if not folder.is_dir():
             self.statusBar().showMessage("指定されたフォルダが見つかりません。")
+            self.generate_button.setEnabled(False)
             return
 
         self._sync_folder_tree(folder)
@@ -290,6 +333,7 @@ class MainWindow(QMainWindow):
                 self.file_list.addItem(item)
 
         self.statusBar().showMessage(f"{len(self.files)} 件のテキストファイルを表示しています。")
+        self.generate_button.setEnabled(bool(self.files))
         if self.files:
             self.file_list.setCurrentRow(0)
             self.file_list.setFocus()
@@ -381,6 +425,7 @@ class MainWindow(QMainWindow):
         self.text_edit.setPlainText(text)
         self.text_edit.document().clearUndoRedoStacks()
         self.text_edit.document().setModified(False)
+        self.results_strip.show_for(path, self.text_edit.toPlainText())
         self.clear_matches()
         self.statusBar().showMessage(f"{path.name} を表示中 / 文字コード: {encoding}")
         if self.search_edit.text():
@@ -540,6 +585,7 @@ class MainWindow(QMainWindow):
             return False
 
         self.text_edit.document().setModified(False)
+        self.results_strip.refresh(text)  # 本文が変わると「前の本文で生成」の印が変わる
         self.statusBar().showMessage(f"{self.current_path.name} を保存しました。バックアップ: {backup_path.name}")
         self.scan_file_list_matches()
         if refocus:
@@ -693,10 +739,19 @@ class MainWindow(QMainWindow):
             bulk_ops.apply_renames(plan)
         except OSError as exc:
             QMessageBox.critical(self, "一括リネーム", f"リネーム中にエラーが発生しました。\n\n{exc}")
+            self.load_folder(confirm=False)
+            return
 
+        # 生成結果のファイル名 (「旧の名前_t2i.png」など) と生成の記録も新しい名前に合わせる
+        moved, errors = results.rename_results(plan)
         renamed_count = len(plan)
         self.load_folder(confirm=False)
-        self.statusBar().showMessage(f"{renamed_count} 件のファイル名を変更しました。")
+        message = f"{renamed_count} 件のファイル名を変更しました。"
+        if moved:
+            message += f" 生成結果 {moved} 件の名前も合わせました。"
+        if errors:
+            message += f" 生成結果の名前を変えられなかったもの: {len(errors)} 件"
+        self.statusBar().showMessage(message)
 
     def open_add_text_dialog(self):
         current_name = self.current_path.name if self.current_path else None
@@ -829,3 +884,68 @@ class MainWindow(QMainWindow):
 
         self.text_edit.document().setModified(True)
         self.statusBar().showMessage("文字列を成型しました（Ctrl+Zで元に戻せます）。内容を確認して保存してください。")
+
+    # ------------------------------------------------------------------
+    # 生成 (ComfyUI)
+    # ------------------------------------------------------------------
+    def prompt_text_for(self, path: Path) -> str:
+        """ワークフローにプロンプトとして渡す本文。表示中のファイルは、保存前の編集も含めて編集欄の内容を使う。"""
+        if path == self.current_path:
+            return self.text_edit.toPlainText()
+        try:
+            text, _encoding = text_io.read_text(path)
+        except OSError:
+            return ""
+        # 編集欄と同じ表記にそろえる (NBSP→空白、CRLF などの改行→LF)
+        return bulk_ops.normalize_needle(text)
+
+    def selected_files(self) -> list[Path]:
+        rows = sorted(self.file_list.row(item) for item in self.file_list.selectedItems())
+        return [self.files[row] for row in rows if 0 <= row < len(self.files)]
+
+    def generate_selected(self):
+        sources = self.selected_files()
+        if not sources and self.current_path is not None:
+            sources = [self.current_path]
+        if not sources:
+            self.statusBar().showMessage("生成するテキストファイルを選択してください。")
+            return
+        self.generation.generate(sources, what="選択中のファイル")
+
+    def generate_all(self):
+        self.generation.generate(list(self.files), what="一覧のファイル")
+
+    def update_jobs_button(self):
+        active = self.generation.active_count
+        self.jobs_button.setText(f"生成ジョブ ({active})" if active else "生成ジョブ")
+
+    def show_file_menu(self, pos):
+        """ファイル一覧の右クリックメニュー (生成 (ComfyUI) の操作)。ファイルがないときは出さない。"""
+        if not self.files:
+            return
+        item = self.file_list.itemAt(pos)
+        clicked = Path(item.data(Qt.ItemDataRole.UserRole)) if item is not None else self.current_path
+        selected = self.selected_files()
+
+        menu = QMenu(self)
+        if len(selected) > 1:
+            generate = menu.addAction(f"選択中のファイルを生成する ({len(selected)} 件)...")
+        else:
+            generate = menu.addAction("生成する (ComfyUI)...")
+        generate.setEnabled(bool(selected))
+        generate.triggered.connect(self.generate_selected)
+        generate_all = menu.addAction(f"一覧のファイルをまとめて生成する ({len(self.files)} 件)...")
+        generate_all.triggered.connect(self.generate_all)
+        info = menu.addAction("生成時の設定...")
+        info.setEnabled(clicked is not None and self.generation.has_history(clicked))
+        info.triggered.connect(lambda: self.generation.show_gen_info(clicked))
+        jobs = menu.addAction("生成ジョブの一覧...	Ctrl+J")
+        jobs.triggered.connect(self.generation.show_jobs)
+        settings = menu.addAction("生成の設定...")
+        settings.triggered.connect(self.generation.show_settings)
+        menu.exec(self.file_list.viewport().mapToGlobal(pos))
+
+    def on_generation_done(self, job):
+        """表示中のテキストから生成したものなら、生成結果の一覧に加える。"""
+        if self.current_path is not None and results.same_path(job.source, self.current_path):
+            self.results_strip.refresh(self.text_edit.toPlainText())
