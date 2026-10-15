@@ -594,13 +594,26 @@ def find_history_by_source(source: str) -> Optional[GenRecord]:
     return _to_record(by_name) if by_name else None
 
 
+_history_cache: tuple = (None, [])  # ((パス, 更新日時, サイズ), 記録)
+
+
 def read_history() -> list[GenRecord]:
-    """すべての記録 (古い順)。"""
+    """すべての記録 (古い順)。
+
+    テキストを選ぶたびに呼ばれるので、ファイルが変わっていなければ前に読んだものを返す。
+    返した記録は書き換えないこと (読むだけの呼び出し元で共有している)。
+    """
+    global _history_cache
     try:
         with _history_lock:
             path = file_path("comfy_history.txt")
-            if not path.is_file():
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
                 return []
+            stamp = (str(path), stat.st_mtime_ns, stat.st_size)
+            if _history_cache[0] == stamp:
+                return list(_history_cache[1])
             lines = path.read_text(encoding="utf-8-sig").splitlines()
     except (OSError, UnicodeDecodeError):
         return []
@@ -612,7 +625,8 @@ def read_history() -> list[GenRecord]:
             continue
         if isinstance(data, dict):
             records.append(_to_record(data))
-    return records
+    _history_cache = (stamp, records)
+    return list(records)
 
 
 def rename_in_history(renames: dict[str, str]) -> int:

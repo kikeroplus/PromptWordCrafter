@@ -73,9 +73,15 @@ def find_results(source: Path, current_text: str, records: Optional[list] = None
             continue
         mine = bool(record.source) and _key(record.source) == source_key
         if not mine:
-            moved_away = bool(record.source) and not Path(record.source).exists()
-            same_prompt = record.request.prompt is not None and _same_text(record.request.prompt, current_text)
-            mine = moved_away and same_prompt and Path(output).parent == source.parent
+            # 元のファイルがあるかの確認 (exists) は最後に回す。記録の元がつながっていない
+            # ネットワークドライブなどにあると 1 回ごとに待たされ、ファイルを選ぶたびに遅くなる
+            mine = (
+                bool(record.source)
+                and record.request.prompt is not None
+                and Path(output).parent == source.parent
+                and _same_text(record.request.prompt, current_text)
+                and not Path(record.source).exists()
+            )
         if not mine:
             continue
         path = Path(output)
