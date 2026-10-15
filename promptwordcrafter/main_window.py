@@ -4,6 +4,7 @@ PromptManager プロジェクトの text_replace_tool.py (Text Preview Search Re
 と同等の機能を PySide6 で再実装したもの。
 """
 
+import os
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -193,6 +194,7 @@ class MainWindow(QMainWindow):
         self.folder_tree.header().resizeSection(0, 1200)
         self.folder_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.folder_tree.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         splitter.addWidget(self.folder_tree)
 
         self.file_list = FileListWidget()
@@ -261,6 +263,7 @@ class MainWindow(QMainWindow):
         self.reformat_button.clicked.connect(self.reformat_current_file)
 
         self.folder_tree.selectionModel().currentChanged.connect(self.on_tree_current_changed)
+        self.folder_tree.customContextMenuRequested.connect(self.show_folder_menu)
 
         self.file_list.customContextMenuRequested.connect(self.show_file_menu)
         self.generate_button.clicked.connect(self.generate_selected)
@@ -928,6 +931,41 @@ class MainWindow(QMainWindow):
 
     def generate_all(self):
         self.generation.generate(list(self.files), what="一覧のファイル")
+
+    def generate_folder(self, folder: Path, recursive: bool):
+        """フォルダツリーで右クリックしたフォルダのテキストを、まとめて生成する。"""
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)  # サブフォルダが多いと数えるのに時間がかかる
+        try:
+            sources = text_io.list_text_files(folder, recursive)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not sources:
+            where = "このフォルダとサブフォルダ" if recursive else "このフォルダ"
+            self.statusBar().showMessage(f"{where}にテキストファイルがありません: {folder}")
+            return
+        what = f"フォルダ「{folder.name or folder}」" + ("とサブフォルダ" if recursive else "")
+        self.generation.generate(sources, what=what)
+
+    def show_folder_menu(self, pos):
+        """フォルダツリーの右クリックメニュー。右クリックしただけではフォルダを開かない。"""
+        index = self.folder_tree.indexAt(pos)
+        if not index.isValid():
+            return
+        folder = Path(self.folder_tree_model.filePath(index))
+        if not folder.is_dir():
+            return
+
+        menu = QMenu(self)
+        count = len(text_io.list_text_files(folder))
+        generate = menu.addAction(f"このフォルダのテキストをまとめて生成する ({count} 件)...")
+        generate.setEnabled(count > 0)
+        generate.triggered.connect(lambda: self.generate_folder(folder, recursive=False))
+        generate_all = menu.addAction("サブフォルダも含めてまとめて生成する...")
+        generate_all.triggered.connect(lambda: self.generate_folder(folder, recursive=True))
+        menu.addSeparator()
+        explorer = menu.addAction("エクスプローラーで開く")
+        explorer.triggered.connect(lambda: os.startfile(str(folder)))
+        menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
 
     def update_jobs_button(self):
         active = self.generation.active_count
