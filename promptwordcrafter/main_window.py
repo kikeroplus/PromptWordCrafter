@@ -40,6 +40,7 @@ from .file_list import FileListWidget
 from .generation import GenerationController
 from .highlighter import TagHighlighter
 from .results_view import ResultsStrip
+from .translation import TranslationController
 from .widgets import FolderTreeView, NewlineAwareLineEdit
 
 FILE_MATCH_BACKGROUND = "#edf5ef"
@@ -164,9 +165,14 @@ class MainWindow(QMainWindow):
         self.generate_settings_button = QPushButton("生成の設定")
         generate_bar.addWidget(self.generate_settings_button)
 
+        # 翻訳 (AI) グループ: 翻訳する | 翻訳の設定 (部品は編集欄を作った後に入れる)
+        translate_group = QGroupBox("翻訳 (AI)")
+        translate_bar = QHBoxLayout(translate_group)
+
         tool_row = QHBoxLayout()
         tool_row.addWidget(bulk_group, 1)
         tool_row.addWidget(generate_group)
+        tool_row.addWidget(translate_group)
         root_layout.addLayout(tool_row)
 
         # フォルダツリー + ファイル一覧 + プレビュー編集
@@ -206,6 +212,11 @@ class MainWindow(QMainWindow):
         editor_splitter.setCollapsible(0, False)
         splitter.addWidget(editor_splitter)
         self.tag_highlighter = TagHighlighter(self.text_edit.document())
+
+        # 編集欄の上に訳を出す小窓 (見るだけ)
+        self.translation = TranslationController(self.text_edit, self.settings_data, self)
+        translate_bar.addWidget(self.translation.checkbox)
+        translate_bar.addWidget(self.translation.settings_button)
 
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
@@ -277,6 +288,7 @@ class MainWindow(QMainWindow):
             "window_y": geo.y(),
             "window_width": geo.width(),
             "window_height": geo.height(),
+            **self.translation.settings(),
         }
         settings_module.save_settings(data)
 
@@ -314,6 +326,7 @@ class MainWindow(QMainWindow):
         self.text_edit.document().setModified(False)
         self.current_path = None
         self.results_strip.clear()
+        self.translation.clear()
         self.count_label.setText("出現回数: 0")
 
         if not folder.is_dir():
@@ -426,6 +439,7 @@ class MainWindow(QMainWindow):
         self.text_edit.document().clearUndoRedoStacks()
         self.text_edit.document().setModified(False)
         self.results_strip.show_for(path, self.text_edit.toPlainText())
+        self.translation.request(self.text_edit.toPlainText(), path.name)
         self.clear_matches()
         self.statusBar().showMessage(f"{path.name} を表示中 / 文字コード: {encoding}")
         if self.search_edit.text():
