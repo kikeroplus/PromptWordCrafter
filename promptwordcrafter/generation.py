@@ -2,10 +2,15 @@
 
 J-Rate の JRate.cs「生成する (ComfyUI)」以降と同じ動き:
 同じ接続先には同時に 2 件まで送り、残りはアプリ側で待機させる。
+
+終わっていないジョブは %APPDATA%/PromptWordCrafter/comfy_jobs.json に書いておき、
+「残して閉じる」で閉じたときや PC が落ちたときは、次に起動したときに続きから始められる。
 """
 
+import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -33,6 +38,9 @@ class GenJob:
         self.outputs: list[str] = []
         self.state = WAITING
         self.status = ""
+        self.prompt_id = ""  # ComfyUI が受け付けた番号 (続きから始めるときに使う)
+        self.started = 0.0  # 実行に移った時刻 (time.monotonic)
+        self.run_time: Optional[float] = None  # 生成にかかった秒数 (完了したときに決まる)
 
     @property
     def file_name(self) -> str:
@@ -54,6 +62,7 @@ class _Signals(QObject):
     """裏のスレッドから、画面のスレッドへ知らせる。"""
 
     progress = Signal(object, str)
+    submitted = Signal(object, str)  # job, prompt_id
     finished = Signal(object, object, object)  # job, outputs, error
 
 
@@ -76,7 +85,10 @@ class GenerationController(QObject):
         self.job_window: Optional[JobWindow] = None
         self._signals = _Signals()
         self._signals.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
+        self._signals.submitted.connect(self._on_submitted, Qt.ConnectionType.QueuedConnection)
         self._signals.finished.connect(self._on_finished, Qt.ConnectionType.QueuedConnection)
+        self._saved_jobs: Optional[str] = None  # 最後に書いた内容 (変わったときだけ書く)
+        self._leftover = _load_jobs()  # 前回終わらなかったジョブ (offer_resume で聞くまでは書き換えない)
 
     # ------------------------------------------------------------------
     # 状態
@@ -94,23 +106,94 @@ class GenerationController(QObject):
         return f"  (実行中 {running} 件" + (f"・待機 {waiting} 件" if waiting else "") + ")"
 
     def confirm_close(self) -> bool:
-        """生成中に閉じようとしたら確かめる。"""
+        """生成中に閉じようとしたら、残すか捨てるかを確かめる。"""
         active = self.active_count
         if not active:
             return True
-        answer = QMessageBox.question(
-            self.window,
-            "生成中",
-            f"生成ジョブが {active} 件残っています。閉じますか？\n\n"
-            "閉じると出来たファイルを受け取れません (ComfyUI 側の実行は止まりません)。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        box = QMessageBox(self.window)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("生成中")
+        box.setText(f"生成ジョブが {active} 件残っています。")
+        box.setInformativeText(
+            "残して閉じる: 次に起動したときに続きから始められます。\n"
+            "捨てて閉じる: 残りのジョブは取り消します。\n\n"
+            "どちらでも、ComfyUI 側で実行中・順番待ちのものは止まりません。"
         )
-        if answer != QMessageBox.StandardButton.Yes:
-            return False
-        for job in self.jobs:
-            job.cancel.set()
-        return True
+        keep = box.addButton("残して閉じる", QMessageBox.ButtonRole.AcceptRole)
+        discard = box.addButton("捨てて閉じる", QMessageBox.ButtonRole.DestructiveRole)
+        stay = box.addButton("やめる", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(stay)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is keep:
+            self._save_jobs()  # 今の状態を確実に書いておく (裏のスレッドは閉じると止まる)
+            return True
+        if clicked is discard:
+            for job in self.jobs:
+                job.cancel.set()
+            _write_jobs([])
+            return True
+        return False
+
+    def offer_resume(self):
+        """前回終わらなかったジョブがあれば、続きから始めるか中断するかを聞く。起動の直後に呼ぶ。"""
+        leftover, self._leftover = self._leftover, None
+        if not leftover:
+            return
+        jobs = []
+        missing = 0
+        for item in leftover:
+            job = _job_from_dict(item)
+            if job is None:
+                continue
+            if not Path(job.source).is_file():
+                missing += 1
+                continue
+            jobs.append(job)
+        if not jobs:
+            _write_jobs([])
+            if missing:
+                QMessageBox.information(
+                    self.window, "生成ジョブ",
+                    f"前回終わらなかった生成ジョブが {missing} 件ありましたが、"
+                    "元のテキストファイルが見つからないため続けられません。",
+                )
+            return
+
+        sent = sum(1 for j in jobs if j.prompt_id)
+        detail = f"(ComfyUI に依頼済み {sent} 件・待機 {len(jobs) - sent} 件)"
+        if missing:
+            detail += f"\n元のテキストファイルが見つからない {missing} 件は除きます。"
+        box = QMessageBox(self.window)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("生成ジョブ")
+        box.setText(f"前回終わらなかった生成ジョブが {len(jobs)} 件あります。")
+        box.setInformativeText(
+            detail + "\n\n"
+            "続きから始める: 依頼済みのものは ComfyUI から結果を受け取ります "
+            "(ComfyUI 側に残っていなければ依頼し直します)。\n"
+            "ジョブを中断: 残りのジョブを取り消します。"
+        )
+        resume = box.addButton("続きから始める", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("ジョブを中断", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(resume)
+        box.setEscapeButton(resume)  # うっかり Esc で捨てないように
+        box.exec()
+        if box.clickedButton() is not resume:
+            # ComfyUI に依頼済みのものは、待ち行列から外しておく (つながらなければそのまま)
+            def drop():
+                for job in jobs:
+                    if job.prompt_id:
+                        comfy.cancel_prompt(job.request.url, job.prompt_id)
+
+            threading.Thread(target=drop, daemon=True).start()
+            _write_jobs([])
+            self.show_status(f"前回の生成ジョブ {len(jobs)} 件を中断しました。")
+            return
+        self.jobs.extend(jobs)
+        self.show_jobs()
+        self._start_jobs()
 
     # ------------------------------------------------------------------
     # 生成する
@@ -193,16 +276,20 @@ class GenerationController(QObject):
 
     def _run(self, job: GenJob):
         job.state = RUNNING
+        job.started = time.monotonic()
         job.set_status("準備中...")
         self._show_job_status(job)
         signals = self._signals
+        prompt_id = job.prompt_id
 
         def work():
             outputs = None
             error = None
             try:
                 outputs = comfy.generate(
-                    job.source, job.request, lambda text: signals.progress.emit(job, text), job.cancel
+                    job.source, job.request, lambda text: signals.progress.emit(job, text), job.cancel,
+                    prompt_id, lambda new_id: signals.submitted.emit(job, new_id),
+                    lambda seconds: setattr(job, "run_time", seconds),
                 )
                 for path in outputs:
                     comfy.add_history(path, job.source, job.request)  # どの設定で作ったかを残す
@@ -218,6 +305,10 @@ class GenerationController(QObject):
         job.set_status("キャンセル中..." if job.cancel.is_set() else text)
         self._show_job_status(job)
         self._changed()
+
+    def _on_submitted(self, job: GenJob, prompt_id: str):
+        job.prompt_id = prompt_id
+        self._save_jobs()
 
     def _on_finished(self, job: GenJob, outputs, error):
         failed = False
@@ -243,6 +334,9 @@ class GenerationController(QObject):
         else:
             job.outputs = list(outputs)
             job.state = DONE
+            if job.run_time is None:
+                # ComfyUI の記録から分からなかったときは、アプリで実行に移してからの時間
+                job.run_time = time.monotonic() - job.started
             extra = f" ほか {len(outputs) - 1} 件" if len(outputs) > 1 else ""
             job.set_status(f"生成しました: {Path(outputs[0]).name}{extra}")
             self.show_status(job.status + self.job_counts())
@@ -275,6 +369,18 @@ class GenerationController(QObject):
         if self.job_window is not None:
             self.job_window.refresh()
         self.jobs_changed.emit()
+        self._save_jobs()
+
+    def _save_jobs(self):
+        """終わっていないジョブを書いておく。前回のジョブをまだ聞いていないうちは書かない。"""
+        if self._leftover is not None:
+            return
+        items = [_job_to_dict(j) for j in self.jobs if j.is_active]
+        text = json.dumps(items, ensure_ascii=False)
+        if text == self._saved_jobs:
+            return
+        if _write_jobs(items):
+            self._saved_jobs = text
 
     def _notify_finished(self):
         """すべてのジョブが終わった。ほかの作業をしているときはタスクバーの点滅と音で知らせる。"""
@@ -338,3 +444,62 @@ class GenerationController(QObject):
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.regenerate:
             # 接続先・ワークフロー・長さは記録のまま、プロンプトは今のファイルの本文で
             self.generate([source], record.request)
+
+
+# ----------------------------------------------------------------------
+# 終わっていないジョブ (%APPDATA%\PromptWordCrafter\comfy_jobs.json)
+# ----------------------------------------------------------------------
+JOBS_FILE = "comfy_jobs.json"
+
+
+def _job_to_dict(job: GenJob) -> dict:
+    return {
+        "source": job.source,
+        "batch": job.batch,
+        "promptId": job.prompt_id,
+        "request": dict(job.request.__dict__),
+    }
+
+
+def _job_from_dict(data) -> Optional[GenJob]:
+    if not isinstance(data, dict) or not isinstance(data.get("request"), dict):
+        return None
+    source = data.get("source")
+    if not isinstance(source, str) or not source:
+        return None
+    fields = comfy.GenRequest.__dataclass_fields__
+    try:
+        request = comfy.GenRequest(**{k: v for k, v in data["request"].items() if k in fields})
+    except TypeError:
+        return None
+    job = GenJob(source, request, bool(data.get("batch")))
+    job.prompt_id = str(data.get("promptId") or "")
+    return job
+
+
+def _load_jobs() -> list:
+    try:
+        path = comfy.file_path(JOBS_FILE)
+        if not path.is_file():
+            return []
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _write_jobs(items: list) -> bool:
+    """書けたら True。空なら消す。書きかけで落ちても壊れないよう、別名に書いてから置き換える。"""
+    try:
+        path = comfy.file_path(JOBS_FILE)
+        if not items:
+            if path.exists():
+                path.unlink()
+            return True
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(path.name + ".tmp")
+        temp.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+        temp.replace(path)
+        return True
+    except OSError:
+        return False

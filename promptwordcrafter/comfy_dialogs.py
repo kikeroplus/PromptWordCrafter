@@ -891,12 +891,12 @@ def _parse_seconds(text: str) -> Optional[float]:
 # 生成ジョブの一覧 (閉じてもジョブは続く)
 # ----------------------------------------------------------------------
 class JobWindow(QWidget):
-    COLUMNS = ("ファイル", "ワークフロー", "状態", "内容")
+    COLUMNS = ("ファイル", "ワークフロー", "状態", "時間", "内容")
 
     def __init__(self, manager, cancel: Callable, show: Callable, parent=None):
         super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle("生成ジョブ - PromptWordCrafter")
-        self.resize(780, 380)
+        self.resize(840, 380)
         self.manager = manager
         self._cancel = cancel
         self._show = show
@@ -908,9 +908,9 @@ class JobWindow(QWidget):
         self.tree.setHeaderLabels(self.COLUMNS)
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         header = self.tree.header()
-        for column, width in enumerate((190, 140, 70)):
+        for column, width in enumerate((190, 140, 70, 60)):
             header.resizeSection(column, width)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.tree, 1)
 
         buttons = QHBoxLayout()
@@ -951,13 +951,14 @@ class JobWindow(QWidget):
             if item is None:
                 item = QTreeWidgetItem()
                 item.setData(0, Qt.ItemDataRole.UserRole, job)
-                self.tree.addTopLevelItem(item)
+                self.tree.insertTopLevelItem(0, item)  # 新しいものを上に
                 self._items[id(job)] = item
             item.setText(0, job.file_name)
             item.setText(1, job.request.workflow_name)
             item.setText(2, job.state_text)
-            item.setText(3, job.status)
-            item.setToolTip(3, job.status)
+            item.setText(3, "" if job.run_time is None else comfy.format_elapsed(job.run_time))
+            item.setText(4, job.status)
+            item.setToolTip(4, job.status)
         self.update_buttons()
 
     def update_buttons(self):

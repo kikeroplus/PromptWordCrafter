@@ -42,6 +42,7 @@ EXPORT_KIND = "comfy-settings"
 
 _rng = random.Random()
 _history_lock = threading.Lock()
+_save_lock = threading.Lock()  # 出来たファイルの名前を決めて保存する間
 
 
 class ComfyError(Exception):
@@ -753,19 +754,40 @@ def is_video_workflow(wf: dict) -> bool:
     return False
 
 
+PROMPT_TITLES = ("positive", "user prompt")  # 文字列ノードのタイトルにこれがあれば本文を入れる
+
+
+def _is_negative(node: dict) -> bool:
+    return "negative" in _title(node).lower()
+
+
+def _clip_text_nodes(wf: dict) -> list[dict]:
+    """文字列が直接入っている CLIPTextEncode (ネガティブ用は除く)。"""
+    return [n for n in _nodes(wf)
+            if _class_type(n) == "CLIPTextEncode" and isinstance(n["inputs"].get("text"), str)
+            and not _is_negative(n)]
+
+
 def _prompt_slots(wf: dict) -> list[tuple[dict, str]]:
-    """文字列が直接入っている prompt 入力があればそこ (すべて)。
-    なければ CLIPTextEncode の text: 1 つならそれ、複数ならタイトルに Positive とあるもの。"""
+    """本文を入れる場所。次のどちらかがあればそこ (すべて):
+      - 文字列が直接入っている prompt 入力
+      - 文字列ノード (PrimitiveStringMultiline など) で、タイトルに Positive / User Prompt とあるもの
+        (ComfyUI のテンプレートは、ここから TextGenerate や CLIP Text Encode へ線でつないでいる)
+    なければ CLIPTextEncode の text: 1 つならそれ、複数ならタイトルに Positive とあるもの。
+    タイトルに Negative とあるノードには入れない。"""
     slots = []
-    clip = []
     for node in _nodes(wf):
         inputs = node["inputs"]
+        if _is_negative(node):
+            continue
         if isinstance(inputs.get("prompt"), str):
             slots.append((inputs, "prompt"))
-        elif _class_type(node) == "CLIPTextEncode" and isinstance(inputs.get("text"), str):
-            clip.append(node)
+        elif (_class_type(node).startswith("PrimitiveString") and isinstance(inputs.get("value"), str)
+              and any(t in _title(node).lower() for t in PROMPT_TITLES)):
+            slots.append((inputs, "value"))
     if slots:
         return slots
+    clip = _clip_text_nodes(wf)
     pick = clip if len(clip) == 1 else [n for n in clip if "positive" in _title(n).lower()]
     return [(n["inputs"], "text") for n in pick]
 
@@ -778,16 +800,16 @@ def prompt_slot_problem(wf: dict) -> Optional[str]:
     """テキストファイルの本文を入れる場所がなければ、その理由 (あれば None)。"""
     if _prompt_slots(wf):
         return None
-    clip = sum(1 for node in _nodes(wf)
-               if _class_type(node) == "CLIPTextEncode" and isinstance(node["inputs"].get("text"), str))
-    if clip > 1:
+    if len(_clip_text_nodes(wf)) > 1:
         return (
             "このワークフローには「CLIP Text Encode」が複数あり、どれにテキストファイルの本文を入れるか決められません。\n"
             "ComfyUI で、本文を入れるノードのタイトルに「Positive」を含めてから、もう一度「Export (API)」で保存してください。"
         )
     return (
         "このワークフローには、テキストファイルの本文 (プロンプト) を入れる場所がありません。\n"
-        "文字列が直接入っている prompt 入力か、「CLIP Text Encode」のあるワークフローを指定してください。"
+        "文字列が直接入っている prompt 入力か、「CLIP Text Encode」のあるワークフローを指定してください。\n"
+        "本文を文字列ノード (Text など) から線でつないでいるときは、そのノードのタイトルに"
+        "「Positive」か「User Prompt」を含めてください (「Negative」とあるノードには入れません)。"
     )
 
 
@@ -897,47 +919,74 @@ def generate(
     req: GenRequest,
     progress: Callable[[str], None],
     cancel: threading.Event,
+    prompt_id: str = "",
+    on_submitted: Optional[Callable[[str], None]] = None,
+    on_run_time: Optional[Callable[[float], None]] = None,
 ) -> list[str]:
     """生成して、保存したファイルのパスを返す (動画なら 1 つ、画像なら出力された枚数ぶん)。
+
+    prompt_id を渡すと、前に依頼したその実行の続きを待つ (アプリを閉じる・PC が落ちるなどで
+    受け取れなかったもの)。ComfyUI 側にもう残っていなければ、最初から依頼し直す。
+    on_submitted(prompt_id) は、ComfyUI が実行を受け付けたときに呼ぶ。
+    on_run_time(秒) は、ComfyUI の記録から実行にかかった時間が分かったときに呼ぶ (順番待ちは含まない)。
 
     失敗したときは ComfyError、cancel で止められたときは ComfyUI 側も取り消して GenerationCancelled。
     """
     base_url = (req.url or DEFAULT_URL).rstrip("/")
-    wf = load_workflow(req.workflow_path)
-    _randomize_seeds(wf)
-    prompt = req.full_prompt
-    if prompt is not None:
-        for inputs, key in _prompt_slots(wf):
-            inputs[key] = prompt
-    if req.seconds is not None:
-        _set_duration(wf, req.seconds)
 
-    if cancel.is_set():
-        raise GenerationCancelled()
-    progress("ComfyUI に実行を依頼中...")
-    res = _json(
-        base_url + "/prompt",
-        "POST",
-        {"prompt": wf, "client_id": "promptwordcrafter-" + uuid.uuid4().hex},
-    )
-    prompt_id = res.get("prompt_id") if isinstance(res, dict) else None
-    if not prompt_id:
-        raise ComfyError(f"ComfyUI が実行を受け付けませんでした。\n{_shorten(str(res))}")
-    prompt_id = str(prompt_id)
+    def submit() -> str:
+        wf = load_workflow(req.workflow_path)
+        _randomize_seeds(wf)
+        prompt = req.full_prompt
+        if prompt is not None:
+            for inputs, key in _prompt_slots(wf):
+                inputs[key] = prompt
+        if req.seconds is not None:
+            _set_duration(wf, req.seconds)
+
+        if cancel.is_set():
+            raise GenerationCancelled()
+        progress("ComfyUI に実行を依頼中...")
+        res = _json(
+            base_url + "/prompt",
+            "POST",
+            {"prompt": wf, "client_id": "promptwordcrafter-" + uuid.uuid4().hex},
+        )
+        new_id = res.get("prompt_id") if isinstance(res, dict) else None
+        if not new_id:
+            raise ComfyError(f"ComfyUI が実行を受け付けませんでした。\n{_shorten(str(res))}")
+        if on_submitted is not None:
+            on_submitted(str(new_id))
+        return str(new_id)
+
+    if prompt_id:
+        progress("前回の続きを確かめています...")
+        delay = 0  # 続きのときは、すぐに様子を見る
+    else:
+        prompt_id = submit()
+        delay = 2
 
     started = time.monotonic()
     failures = 0
     while True:
-        if cancel.wait(2):
+        if cancel.wait(delay):
             _cancel_prompt(base_url, prompt_id)
             raise GenerationCancelled()
+        delay = 2
         try:
+            # 待ち行列を先に見てから記録を見る (その間に終わっても、記録のほうで拾える)
+            state = _queue_state(base_url, prompt_id)
             history = _json(base_url + "/history/" + urllib.parse.quote(prompt_id, safe=""))
             entry = history.get(prompt_id) if isinstance(history, dict) else None
             if isinstance(entry, dict):
                 break
-            progress(f"{_queue_state(base_url, prompt_id)} {_elapsed(started)}")
             failures = 0
+            if state is None:
+                # 待ち行列にも記録にもない (ComfyUI を再起動したなど): 最初から依頼し直す
+                prompt_id = submit()
+                started = time.monotonic()
+                continue
+            progress(f"{state} {_elapsed(started)}")
         except ComfyConnectionError:
             # ComfyUI が落ちた・再起動中など。1 分ほど続いたらあきらめる
             failures += 1
@@ -946,6 +995,9 @@ def generate(
             progress(f"ComfyUI の応答待ち... {_elapsed(started)}")
 
     _check_status(entry)
+    run_time = _run_seconds(entry)
+    if run_time is not None and on_run_time is not None:
+        on_run_time(run_time)
     outputs = _find_outputs(entry)
     if not outputs:
         raise ComfyError(
@@ -964,23 +1016,33 @@ def generate(
         else:
             progress("結果を受け取り中...")
         suffix = "_video" if output["video"] else "_t2i"
-        dest = _unique_path(src.with_name(src.stem + suffix + Path(output["filename"]).suffix))
         query = urllib.parse.urlencode(
             {"filename": output["filename"], "subfolder": output["subfolder"], "type": output["type"]}
         )
         data = _request(base_url + "/view?" + query, timeout=120)
-        temp = dest.with_name(dest.name + ".part")
-        try:
-            temp.write_bytes(data)
-            temp.replace(dest)
-        finally:
-            if temp.exists():
-                try:
-                    temp.unlink()
-                except OSError:
-                    pass
+        # 同時に終わったジョブが同じ名前を選ばないよう、名前を決めてから置くまでを 1 件ずつ行う
+        with _save_lock:
+            dest = _unique_path(src.with_name(src.stem + suffix + Path(output["filename"]).suffix))
+            temp = dest.with_name(dest.name + ".part")
+            try:
+                temp.write_bytes(data)
+                temp.replace(dest)
+            finally:
+                if temp.exists():
+                    try:
+                        temp.unlink()
+                    except OSError:
+                        pass
         saved.append(str(dest))
     return saved
+
+
+def cancel_prompt(url: str, prompt_id: str) -> None:
+    """ComfyUI に依頼済みの実行を取り消す (つながらなければ何もしない)。"""
+    try:
+        _cancel_prompt((url or DEFAULT_URL).rstrip("/"), prompt_id)
+    except ComfyError:
+        pass
 
 
 def _cancel_prompt(base_url: str, prompt_id: str) -> None:
@@ -1003,20 +1065,27 @@ def _contains_prompt(items, prompt_id: str) -> bool:
     )
 
 
-def _queue_state(base_url: str, prompt_id: str) -> str:
+def _queue_state(base_url: str, prompt_id: str) -> Optional[str]:
+    """待ち行列での様子。待ち行列にいないと分かったときは None。
+
+    接続できないときは ComfyConnectionError をそのまま投げる (呼び出し元で待ち続ける)。
+    """
     try:
         queue = _json(base_url + "/queue")
-        if isinstance(queue, dict):
-            if _contains_prompt(queue.get("queue_running"), prompt_id):
-                return "生成中"
-            pending = [x for x in queue.get("queue_pending") or [] if isinstance(x, list) and len(x) >= 2]
-            pending.sort(key=lambda x: x[0] if _is_number(x[0]) else 0)
-            for i, item in enumerate(pending):
-                if str(item[1]) == prompt_id:
-                    return f"順番待ち ({i + 1} 番目)"
+    except ComfyConnectionError:
+        raise
     except ComfyError:
-        pass
-    return "生成中"
+        return "生成中"
+    if not isinstance(queue, dict):
+        return "生成中"
+    if _contains_prompt(queue.get("queue_running"), prompt_id):
+        return "生成中"
+    pending = [x for x in queue.get("queue_pending") or [] if isinstance(x, list) and len(x) >= 2]
+    pending.sort(key=lambda x: x[0] if _is_number(x[0]) else 0)
+    for i, item in enumerate(pending):
+        if str(item[1]) == prompt_id:
+            return f"順番待ち ({i + 1} 番目)"
+    return None
 
 
 def _check_status(entry: dict) -> None:
@@ -1032,6 +1101,20 @@ def _check_status(entry: dict) -> None:
         text = str(data.get("exception_message") or "").strip()
         detail = (f"[{node_type}] " if node_type else "") + text
     raise ComfyError(f"ComfyUI での生成中にエラーが起きました。\n{_shorten(detail)}")
+
+
+def _run_seconds(entry: dict) -> Optional[float]:
+    """記録の execution_start から execution_success までの秒数 (分からなければ None)。"""
+    status = entry.get("status")
+    stamps = {}
+    for message in (status.get("messages") or []) if isinstance(status, dict) else []:
+        if (isinstance(message, list) and len(message) >= 2 and isinstance(message[1], dict)
+                and _is_number(message[1].get("timestamp"))):
+            stamps[message[0]] = message[1]["timestamp"]  # ミリ秒
+    start, end = stamps.get("execution_start"), stamps.get("execution_success")
+    if start is None or end is None or end < start:
+        return None
+    return (end - start) / 1000
 
 
 def _find_outputs(entry: dict) -> list[dict]:
@@ -1083,9 +1166,16 @@ def _unique_path(path: Path) -> Path:
         i += 1
 
 
-def _elapsed(started: float) -> str:
-    seconds = int(time.monotonic() - started)
+def format_elapsed(seconds: float) -> str:
+    """「1:05」の形 (1 時間を超えたら「1:02:05」)。"""
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
     return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _elapsed(started: float) -> str:
+    return format_elapsed(time.monotonic() - started)
 
 
 def _shorten(text: str) -> str:

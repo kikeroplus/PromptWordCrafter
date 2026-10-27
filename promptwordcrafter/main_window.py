@@ -82,6 +82,8 @@ class MainWindow(QMainWindow):
         self._connect_signals()
 
         self.load_folder(confirm=False)
+        # 前回終わらなかった生成ジョブは、ウィンドウが出てから聞く
+        QTimer.singleShot(0, self.generation.offer_resume)
 
     # ------------------------------------------------------------------
     # UI construction
