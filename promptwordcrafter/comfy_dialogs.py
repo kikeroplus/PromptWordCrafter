@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QBrush, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -37,6 +37,7 @@ from . import comfy
 OK_COLOR = "#2e7d32"
 ERROR_COLOR = "#b71c1c"
 HINT_COLOR = "#666666"
+RUNNING_BACK = QColor(46, 125, 50, 50)  # ジョブ一覧で実行中の行 (OK_COLOR を薄く。明るい・暗い配色どちらでも読める)
 
 MAX_SECONDS = 60
 MAX_REPEAT = 20
@@ -896,13 +897,17 @@ class JobWindow(QWidget):
     def __init__(self, manager, cancel: Callable, show: Callable, parent=None):
         super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle("生成ジョブ - PromptWordCrafter")
-        self.resize(840, 380)
+        self.resize(840, 420)
         self.manager = manager
         self._cancel = cancel
         self._show = show
         self._items = {}
 
         layout = QVBoxLayout(self)
+        # 今どれを処理しているかを、一覧をスクロールしても見えるように上に出す
+        self.running_label = QLabel()
+        self.running_label.setWordWrap(True)
+        layout.addWidget(self.running_label)
         self.tree = QTreeWidget()
         self.tree.setRootIsDecorated(False)
         self.tree.setHeaderLabels(self.COLUMNS)
@@ -946,12 +951,13 @@ class JobWindow(QWidget):
         for key in [k for k in self._items if k not in alive]:
             item = self._items.pop(key)
             self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(item))
+        newly_running = None
         for job in jobs:
             item = self._items.get(id(job))
             if item is None:
                 item = QTreeWidgetItem()
                 item.setData(0, Qt.ItemDataRole.UserRole, job)
-                self.tree.insertTopLevelItem(0, item)  # 新しいものを上に
+                self.tree.addTopLevelItem(item)
                 self._items[id(job)] = item
             item.setText(0, job.file_name)
             item.setText(1, job.request.workflow_name)
@@ -959,6 +965,32 @@ class JobWindow(QWidget):
             item.setText(3, "" if job.run_time is None else comfy.format_elapsed(job.run_time))
             item.setText(4, job.status)
             item.setToolTip(4, job.status)
+            # 実行中の行は色を付けて太字に
+            was_running = bool(item.data(1, Qt.ItemDataRole.UserRole))
+            if job.is_running != was_running:
+                item.setData(1, Qt.ItemDataRole.UserRole, job.is_running)
+                font = item.font(0)
+                font.setBold(job.is_running)
+                for column in range(len(self.COLUMNS)):
+                    item.setFont(column, font)
+                    item.setBackground(column, QBrush(RUNNING_BACK) if job.is_running else QBrush())
+                if job.is_running and newly_running is None:
+                    newly_running = item
+        if newly_running is not None:
+            # 新しく実行に移ったものが見えるようにする (見えていればスクロールしない)
+            self.tree.scrollToItem(newly_running)
+
+        running = [j for j in jobs if j.is_running]
+        waiting = sum(1 for j in jobs if j.is_active and not j.is_running)
+        if running:
+            lines = [f"実行中: {j.file_name}  {j.status}" for j in running]
+            if waiting:
+                lines.append(f"待機 {waiting} 件")
+            self.running_label.setText("\n".join(lines))
+            self.running_label.setStyleSheet(f"color: {OK_COLOR}; font-weight: bold;")
+        else:
+            self.running_label.setText("実行中のジョブはありません")
+            self.running_label.setStyleSheet(f"color: {HINT_COLOR};")
         self.update_buttons()
 
     def update_buttons(self):

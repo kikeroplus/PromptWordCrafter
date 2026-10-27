@@ -51,6 +51,10 @@ class GenJob:
         return self.state in (WAITING, RUNNING)
 
     @property
+    def is_running(self) -> bool:
+        return self.state == RUNNING
+
+    @property
     def state_text(self) -> str:
         return STATE_TEXT[self.state]
 
