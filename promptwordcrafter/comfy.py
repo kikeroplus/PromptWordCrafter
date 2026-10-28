@@ -768,13 +768,73 @@ def _clip_text_nodes(wf: dict) -> list[dict]:
             and not _is_negative(n)]
 
 
+PROMPT_MARKER = "{prompt}"  # ワークフローの文字列にこれがあれば、そこを本文に置き換える
+
+
+def _is_link(value) -> bool:
+    return isinstance(value, list) and len(value) == 2 and isinstance(value[0], str)
+
+
+def _switch_unused_key(inputs: dict) -> Optional[str]:
+    """If/Else Switch (on_true / on_false) で、今の switch の値では使われない側の入力名。
+    switch が線でつながっているなど決まらないときは None (どちらも使われるとみなす)。"""
+    if "on_true" in inputs and "on_false" in inputs and isinstance(inputs.get("switch"), bool):
+        return "on_false" if inputs["switch"] else "on_true"
+    return None
+
+
+def _used_node_ids(wf: dict) -> set:
+    """実際に実行されるノード。どこからも使われていないノード (保存など) から線を逆にたどる。
+    Switch は使われない側の線をたどらない。"""
+    referenced = {v[0] for node in _nodes(wf) for v in node["inputs"].values() if _is_link(v)}
+    stack = [nid for nid, node in wf.items()
+             if isinstance(node, dict) and isinstance(node.get("inputs"), dict) and nid not in referenced]
+    used = set()
+    while stack:
+        nid = stack.pop()
+        if nid in used or not isinstance(wf.get(nid), dict):
+            continue
+        used.add(nid)
+        inputs = wf[nid].get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        unused = _switch_unused_key(inputs)
+        stack.extend(v[0] for k, v in inputs.items() if k != unused and _is_link(v))
+    return used
+
+
+def _is_used_slot(wf: dict, used: set, inputs: dict, key: str) -> bool:
+    for nid in used:
+        if wf[nid].get("inputs") is inputs:
+            return key != _switch_unused_key(inputs)
+    return False
+
+
+def _marker_slots(wf: dict) -> list[tuple[dict, str]]:
+    """文字列に {prompt} の目印が入っている入力 (ノードの種類・タイトルは問わない)。"""
+    return [(node["inputs"], key) for node in _nodes(wf)
+            for key, value in node["inputs"].items()
+            if isinstance(value, str) and PROMPT_MARKER in value]
+
+
 def _prompt_slots(wf: dict) -> list[tuple[dict, str]]:
-    """本文を入れる場所。次のどちらかがあればそこ (すべて):
+    """本文を入れる場所のうち、実際に使われるもの (Switch で使われない側などは除く)。"""
+    used = _used_node_ids(wf)
+    return [(inputs, key) for inputs, key in _prompt_slot_candidates(wf)
+            if _is_used_slot(wf, used, inputs, key)]
+
+
+def _prompt_slot_candidates(wf: dict) -> list[tuple[dict, str]]:
+    """本文を入れる場所の候補。{prompt} の目印があればそこ (すべて。目印の部分だけを置き換える)。
+    目印がなければ、次のどちらかがあればそこ (すべて):
       - 文字列が直接入っている prompt 入力
       - 文字列ノード (PrimitiveStringMultiline など) で、タイトルに Positive / User Prompt とあるもの
         (ComfyUI のテンプレートは、ここから TextGenerate や CLIP Text Encode へ線でつないでいる)
     なければ CLIPTextEncode の text: 1 つならそれ、複数ならタイトルに Positive とあるもの。
     タイトルに Negative とあるノードには入れない。"""
+    marked = _marker_slots(wf)
+    if marked:
+        return marked
     slots = []
     for node in _nodes(wf):
         inputs = node["inputs"]
@@ -800,6 +860,19 @@ def prompt_slot_problem(wf: dict) -> Optional[str]:
     """テキストファイルの本文を入れる場所がなければ、その理由 (あれば None)。"""
     if _prompt_slots(wf):
         return None
+    if _marker_slots(wf):
+        return (
+            f"このワークフローの「{PROMPT_MARKER}」の目印は、どれも実際には使われない場所にあります "
+            "(If/Else Switch の使われない側など)。\n"
+            f"ComfyUI で、画像に使われる文字欄に「{PROMPT_MARKER}」を書いてから、もう一度「Export (API)」で保存してください。"
+        )
+    if _prompt_slot_candidates(wf):
+        return (
+            "このワークフローで本文を入れる場所は、実際には使われていません "
+            "(If/Else Switch の使われない側につながっているなど)。\n"
+            f"ComfyUI で、画像に使われる文字欄に「{PROMPT_MARKER}」と書いてから、もう一度「Export (API)」で保存してください。"
+            f"\n「{PROMPT_MARKER}」があれば、そこを本文に置き換えます (前後に書いた語はそのまま残ります)。"
+        )
     if len(_clip_text_nodes(wf)) > 1:
         return (
             "このワークフローには「CLIP Text Encode」が複数あり、どれにテキストファイルの本文を入れるか決められません。\n"
@@ -809,7 +882,8 @@ def prompt_slot_problem(wf: dict) -> Optional[str]:
         "このワークフローには、テキストファイルの本文 (プロンプト) を入れる場所がありません。\n"
         "文字列が直接入っている prompt 入力か、「CLIP Text Encode」のあるワークフローを指定してください。\n"
         "本文を文字列ノード (Text など) から線でつないでいるときは、そのノードのタイトルに"
-        "「Positive」か「User Prompt」を含めてください (「Negative」とあるノードには入れません)。"
+        "「Positive」か「User Prompt」を含めてください (「Negative」とあるノードには入れません)。\n"
+        f"どのノードでも、文字欄に「{PROMPT_MARKER}」と書けば、そこを本文に置き換えます。"
     )
 
 
@@ -859,7 +933,8 @@ def describe_workflow(wf: dict) -> str:
     """設定画面に出す確認結果。"""
     kind = "動画用" if is_video_workflow(wf) else "画像用"
     slots = len(_prompt_slots(wf))
-    prompt = f"本文を入れる場所 {slots} か所" if slots else "本文を入れる場所がありません"
+    where = f"「{PROMPT_MARKER}」の目印" if _marker_slots(wf) else "本文を入れる場所"
+    prompt = f"{where} {slots} か所" if slots else "本文を入れる場所がありません"
     duration = "長さを変えられます" if get_duration(wf) is not None else "長さは変えられません"
     text = f"ワークフローを確認しました ({kind}、ノード {len(wf)} 個、{prompt}、{duration})"
     if count_nodes(wf, "LoadImage"):
@@ -939,8 +1014,9 @@ def generate(
         _randomize_seeds(wf)
         prompt = req.full_prompt
         if prompt is not None:
+            marked = bool(_marker_slots(wf))
             for inputs, key in _prompt_slots(wf):
-                inputs[key] = prompt
+                inputs[key] = inputs[key].replace(PROMPT_MARKER, prompt) if marked else prompt
         if req.seconds is not None:
             _set_duration(wf, req.seconds)
 
