@@ -57,6 +57,14 @@ class GenerationCancelled(Exception):
     pass
 
 
+class GenerationHeld(Exception):
+    """一時停止中なので、依頼し直さずに待機に戻す。sent は ComfyUI 側に残っているかもしれないとき True。"""
+
+    def __init__(self, sent: bool):
+        super().__init__()
+        self.sent = sent
+
+
 # ----------------------------------------------------------------------
 # プリセット・セット・1 回の生成の設定
 # ----------------------------------------------------------------------
@@ -997,6 +1005,7 @@ def generate(
     prompt_id: str = "",
     on_submitted: Optional[Callable[[str], None]] = None,
     on_run_time: Optional[Callable[[float], None]] = None,
+    held: Optional[Callable[[], bool]] = None,
 ) -> list[str]:
     """生成して、保存したファイルのパスを返す (動画なら 1 つ、画像なら出力された枚数ぶん)。
 
@@ -1004,6 +1013,7 @@ def generate(
     受け取れなかったもの)。ComfyUI 側にもう残っていなければ、最初から依頼し直す。
     on_submitted(prompt_id) は、ComfyUI が実行を受け付けたときに呼ぶ。
     on_run_time(秒) は、ComfyUI の記録から実行にかかった時間が分かったときに呼ぶ (順番待ちは含まない)。
+    held() が True を返すあいだ (一時停止中) は、依頼し直さず・接続が切れても失敗にせず GenerationHeld。
 
     失敗したときは ComfyError、cancel で止められたときは ComfyUI 側も取り消して GenerationCancelled。
     """
@@ -1059,6 +1069,8 @@ def generate(
             failures = 0
             if state is None:
                 # 待ち行列にも記録にもない (ComfyUI を再起動したなど): 最初から依頼し直す
+                if held is not None and held():
+                    raise GenerationHeld(sent=False)
                 prompt_id = submit()
                 started = time.monotonic()
                 continue
@@ -1067,6 +1079,8 @@ def generate(
             # ComfyUI が落ちた・再起動中など。1 分ほど続いたらあきらめる
             failures += 1
             if failures >= 30:
+                if held is not None and held():
+                    raise GenerationHeld(sent=True)  # 再開したときに、まだ残っていれば受け取る
                 raise ComfyError(f"ComfyUI との接続が切れました。({base_url})")
             progress(f"ComfyUI の応答待ち... {_elapsed(started)}")
 

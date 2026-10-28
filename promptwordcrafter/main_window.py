@@ -971,7 +971,8 @@ class MainWindow(QMainWindow):
 
     def update_jobs_button(self):
         active = self.generation.active_count
-        self.jobs_button.setText(f"生成ジョブ ({active})" if active else "生成ジョブ")
+        paused = "・一時停止中" if self.generation.paused else ""
+        self.jobs_button.setText(f"生成ジョブ ({active}{paused})" if active else "生成ジョブ")
 
     def show_file_menu(self, pos):
         """ファイル一覧の右クリックメニュー (生成 (ComfyUI) の操作)。ファイルがないときは出さない。"""

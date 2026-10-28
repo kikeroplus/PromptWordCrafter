@@ -39,6 +39,7 @@ class GenJob:
         self.state = WAITING
         self.status = ""
         self.prompt_id = ""  # ComfyUI が受け付けた番号 (続きから始めるときに使う)
+        self.held = False  # 一時停止中に待機へ戻したもの (再開するまで実行に移さない)
         self.started = 0.0  # 実行に移った時刻 (time.monotonic)
         self.run_time: Optional[float] = None  # 生成にかかった秒数 (完了したときに決まる)
 
@@ -92,7 +93,11 @@ class GenerationController(QObject):
         self._signals.submitted.connect(self._on_submitted, Qt.ConnectionType.QueuedConnection)
         self._signals.finished.connect(self._on_finished, Qt.ConnectionType.QueuedConnection)
         self._saved_jobs: Optional[str] = None  # 最後に書いた内容 (変わったときだけ書く)
-        self._leftover = _load_jobs()  # 前回終わらなかったジョブ (offer_resume で聞くまでは書き換えない)
+        # 前回終わらなかったジョブ (offer_resume で聞くまでは書き換えない)
+        self._leftover, self._leftover_paused = _load_jobs()
+        # 一時停止中は新しく ComfyUI に依頼しない (依頼済みのものは最後まで生成して受け取る)。
+        # 終わっていないジョブがなくなったら解く
+        self.paused = False
 
     # ------------------------------------------------------------------
     # 状態
@@ -105,21 +110,44 @@ class GenerationController(QObject):
         """複数のジョブが残っているときだけ件数を添える。"""
         running = sum(1 for j in self.jobs if j.state == RUNNING)
         waiting = sum(1 for j in self.jobs if j.state == WAITING)
-        if running + waiting <= 1:
-            return ""
-        return f"  (実行中 {running} 件" + (f"・待機 {waiting} 件" if waiting else "") + ")"
+        text = ""
+        if running + waiting > 1:
+            text = f"  (実行中 {running} 件" + (f"・待機 {waiting} 件" if waiting else "") + ")"
+        return text + ("  [一時停止中]" if self.paused else "")
+
+    def set_paused(self, paused: bool):
+        if paused == self.paused or (paused and not self.active_count):
+            return
+        self.paused = paused
+        if paused:
+            running = sum(1 for j in self.jobs if j.state == RUNNING)
+            self.show_status(
+                "生成ジョブを一時停止しました。"
+                + (f"実行中の {running} 件は最後まで生成します。" if running else "")
+            )
+        else:
+            self.show_status("生成ジョブを再開しました。" + self.job_counts())
+        self._start_jobs()
 
     def confirm_close(self) -> bool:
         """生成中に閉じようとしたら、残すか捨てるかを確かめる。"""
         active = self.active_count
         if not active:
             return True
+        if self.paused and not any(j.state == RUNNING for j in self.jobs):
+            # 一時停止して止まりきっているなら、聞かずに残す (次に起動したときも一時停止のまま)
+            self._save_jobs()
+            return True
         box = QMessageBox(self.window)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle("生成中")
         box.setText(f"生成ジョブが {active} 件残っています。")
+        if self.paused:
+            keep_text = "次に起動したときも一時停止のまま残ります (実行中のものは、起動したときに結果を受け取ります)。"
+        else:
+            keep_text = "次に起動したときに続きから始められます。"
         box.setInformativeText(
-            "残して閉じる: 次に起動したときに続きから始められます。\n"
+            f"残して閉じる: {keep_text}\n"
             "捨てて閉じる: 残りのジョブは取り消します。\n\n"
             "どちらでも、ComfyUI 側で実行中・順番待ちのものは止まりません。"
         )
@@ -163,6 +191,18 @@ class GenerationController(QObject):
                     f"前回終わらなかった生成ジョブが {missing} 件ありましたが、"
                     "元のテキストファイルが見つからないため続けられません。",
                 )
+            return
+
+        if self._leftover_paused:
+            # 一時停止したまま閉じたもの: 聞かずに一時停止のまま一覧に戻す
+            # (依頼済みのものだけ、ComfyUI から結果を受け取る)
+            self.paused = True
+            self.jobs.extend(jobs)
+            self._start_jobs()
+            message = f"前回一時停止した生成ジョブが {len(jobs)} 件あります。ジョブ一覧の「再開」で続きを生成します。"
+            if missing:
+                message += f" (元のテキストファイルが見つからない {missing} 件は除きました)"
+            self.show_status(message)
             return
 
         sent = sum(1 for j in jobs if j.prompt_id)
@@ -263,15 +303,20 @@ class GenerationController(QObject):
         for source, req in requests:
             for _ in range(repeat):
                 self.jobs.append(GenJob(str(source), req, batch))
-        if batch:
+        if batch or self.paused:
             self.show_jobs()
         self._start_jobs()
-        if skipped:
-            self.show_status(f"本文が空の {skipped} 件は生成しませんでした。" + self.job_counts())
+        message = f"本文が空の {skipped} 件は生成しませんでした。" if skipped else ""
+        if self.paused:
+            message += "一時停止中です。ジョブ一覧の「再開」で生成を始めます。"
+        if message:
+            self.show_status(message + self.job_counts())
 
     def _start_jobs(self):
         """待機中のジョブを、接続先ごとに MAX_RUNNING_JOBS 件まで実行に移す。"""
         for job in [j for j in self.jobs if j.state == WAITING]:
+            if self.paused and (not job.prompt_id or job.held):
+                continue  # 一時停止中は新しく依頼しない (依頼済みのものは結果を受け取る)
             url = job.request.url
             if sum(1 for j in self.jobs if j.state == RUNNING and j.request.url == url) >= MAX_RUNNING_JOBS:
                 continue
@@ -280,6 +325,7 @@ class GenerationController(QObject):
 
     def _run(self, job: GenJob):
         job.state = RUNNING
+        job.held = False
         job.started = time.monotonic()
         job.set_status("準備中...")
         self._show_job_status(job)
@@ -294,6 +340,7 @@ class GenerationController(QObject):
                     job.source, job.request, lambda text: signals.progress.emit(job, text), job.cancel,
                     prompt_id, lambda new_id: signals.submitted.emit(job, new_id),
                     lambda seconds: setattr(job, "run_time", seconds),
+                    lambda: self.paused,
                 )
                 for path in outputs:
                     comfy.add_history(path, job.source, job.request)  # どの設定で作ったかを残す
@@ -317,7 +364,15 @@ class GenerationController(QObject):
     def _on_finished(self, job: GenJob, outputs, error):
         failed = False
         message = ""
-        if isinstance(error, comfy.GenerationCancelled) or (error is not None and job.cancel.is_set()):
+        if isinstance(error, comfy.GenerationHeld) and not job.cancel.is_set():
+            # 一時停止中に ComfyUI 側から消えた・つながらなくなった: 待機に戻して再開を待つ
+            job.state = WAITING
+            job.held = True
+            if not error.sent:
+                job.prompt_id = ""
+            job.set_status("一時停止のため待機に戻しました")
+            self.show_status(f"{job.file_name} を待機に戻しました" + self.job_counts())
+        elif isinstance(error, comfy.GenerationCancelled) or (error is not None and job.cancel.is_set()):
             job.state = CANCELED
             job.set_status("キャンセルしました")
             self.show_status(f"生成をキャンセルしました: {job.file_name}" + self.job_counts())
@@ -370,6 +425,8 @@ class GenerationController(QObject):
         self.show_status(f"生成 {job.file_name} : {job.status}" + self.job_counts())
 
     def _changed(self):
+        if self.paused and not self.active_count:
+            self.paused = False
         if self.job_window is not None:
             self.job_window.refresh()
         self.jobs_changed.emit()
@@ -380,10 +437,10 @@ class GenerationController(QObject):
         if self._leftover is not None:
             return
         items = [_job_to_dict(j) for j in self.jobs if j.is_active]
-        text = json.dumps(items, ensure_ascii=False)
+        text = json.dumps([self.paused, items], ensure_ascii=False)
         if text == self._saved_jobs:
             return
-        if _write_jobs(items):
+        if _write_jobs(items, self.paused):
             self._saved_jobs = text
 
     def _notify_finished(self):
@@ -481,18 +538,22 @@ def _job_from_dict(data) -> Optional[GenJob]:
     return job
 
 
-def _load_jobs() -> list:
+def _load_jobs() -> tuple[list, bool]:
+    """(ジョブの一覧, 一時停止したまま閉じたか)。前の版の、一覧だけの形も読む。"""
     try:
         path = comfy.file_path(JOBS_FILE)
         if not path.is_file():
-            return []
+            return [], False
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeDecodeError, ValueError):
-        return []
-    return data if isinstance(data, list) else []
+        return [], False
+    if isinstance(data, dict):
+        jobs = data.get("jobs")
+        return (jobs if isinstance(jobs, list) else []), bool(data.get("paused"))
+    return (data if isinstance(data, list) else []), False
 
 
-def _write_jobs(items: list) -> bool:
+def _write_jobs(items: list, paused: bool = False) -> bool:
     """書けたら True。空なら消す。書きかけで落ちても壊れないよう、別名に書いてから置き換える。"""
     try:
         path = comfy.file_path(JOBS_FILE)
@@ -502,7 +563,8 @@ def _write_jobs(items: list) -> bool:
             return True
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(path.name + ".tmp")
-        temp.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+        data = {"paused": paused, "jobs": items}
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         temp.replace(path)
         return True
     except OSError:

@@ -37,6 +37,7 @@ from . import comfy
 OK_COLOR = "#2e7d32"
 ERROR_COLOR = "#b71c1c"
 HINT_COLOR = "#666666"
+PAUSED_COLOR = "#e65100"  # ジョブ一覧の一時停止中の表示
 RUNNING_BACK = QColor(46, 125, 50, 50)  # ジョブ一覧で実行中の行 (OK_COLOR を薄く。明るい・暗い配色どちらでも読める)
 
 MAX_SECONDS = 60
@@ -919,17 +920,25 @@ class JobWindow(QWidget):
         layout.addWidget(self.tree, 1)
 
         buttons = QHBoxLayout()
+        self.pause_button = QPushButton("一時停止")
+        self.pause_button.setToolTip(
+            "新しく ComfyUI に依頼するのを止めます (実行中のものは最後まで生成します)。\n"
+            "一時停止のままアプリを閉じると、次に起動したときも一時停止のまま残ります。\n"
+            "ワークフローは依頼するときに読み直すので、直してから再開できます。"
+        )
         self.cancel_button = QPushButton("選択したものをキャンセル")
         self.cancel_all_button = QPushButton("すべてキャンセル")
         self.show_button = QPushButton("結果を表示")
         self.clear_button = QPushButton("終わったものを消す")
-        for button in (self.cancel_button, self.cancel_all_button, self.show_button, self.clear_button):
+        for button in (self.pause_button, self.cancel_button, self.cancel_all_button,
+                       self.show_button, self.clear_button):
             buttons.addWidget(button)
         buttons.addStretch(1)
         close = QPushButton("閉じる")
         buttons.addWidget(close)
         layout.addLayout(buttons)
 
+        self.pause_button.clicked.connect(self._toggle_pause)
         self.cancel_button.clicked.connect(self._cancel_selected)
         self.cancel_all_button.clicked.connect(self._cancel_all)
         self.show_button.clicked.connect(self._show_selected)
@@ -961,7 +970,8 @@ class JobWindow(QWidget):
                 self._items[id(job)] = item
             item.setText(0, job.file_name)
             item.setText(1, job.request.workflow_name)
-            item.setText(2, job.state_text)
+            paused = self.manager.paused and job.is_active and not job.is_running
+            item.setText(2, "一時停止" if paused else job.state_text)
             item.setText(3, "" if job.run_time is None else comfy.format_elapsed(job.run_time))
             item.setText(4, job.status)
             item.setToolTip(4, job.status)
@@ -982,7 +992,15 @@ class JobWindow(QWidget):
 
         running = [j for j in jobs if j.is_running]
         waiting = sum(1 for j in jobs if j.is_active and not j.is_running)
-        if running:
+        if self.manager.paused:
+            lines = [f"実行中: {j.file_name}  {j.status}" for j in running]
+            if running:
+                lines.append(f"一時停止中: 実行中のものが終わったら止まります (待機 {waiting} 件)")
+            else:
+                lines.append(f"一時停止中 (待機 {waiting} 件)。「再開」で続きを生成します")
+            self.running_label.setText("\n".join(lines))
+            self.running_label.setStyleSheet(f"color: {PAUSED_COLOR}; font-weight: bold;")
+        elif running:
             lines = [f"実行中: {j.file_name}  {j.status}" for j in running]
             if waiting:
                 lines.append(f"待機 {waiting} 件")
@@ -996,10 +1014,16 @@ class JobWindow(QWidget):
     def update_buttons(self):
         selected = self._selected_jobs()
         jobs = self.manager.jobs
+        self.pause_button.setText("再開" if self.manager.paused else "一時停止")
+        self.pause_button.setEnabled(any(j.is_active for j in jobs))
         self.cancel_button.setEnabled(any(j.is_active for j in selected))
         self.cancel_all_button.setEnabled(any(j.is_active for j in jobs))
         self.show_button.setEnabled(len(selected) == 1 and bool(selected[0].outputs))
         self.clear_button.setEnabled(any(not j.is_active for j in jobs))
+
+    def _toggle_pause(self):
+        self.manager.set_paused(not self.manager.paused)
+        self.refresh()
 
     def _cancel_selected(self):
         for job in self._selected_jobs():
