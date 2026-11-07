@@ -14,14 +14,15 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 
-from . import comfy
+from . import comfy, enhancer, llm
 from .comfy_dialogs import ComfySettingsDialog, GenerateDialog, GenInfoDialog, JobWindow
 
 MAX_RUNNING_JOBS = 2  # 同じ接続先に同時に依頼する件数
 CONFIRM_JOB_COUNT = 30  # これを超える件数を登録するときは確かめる
+PROGRESS_REFRESH_MS = 300  # 進み具合でジョブ一覧を描き直すのは、この間隔に 1 回まで (ジョブが多くても重くしない)
 
 WAITING, RUNNING, DONE, FAILED, CANCELED = range(5)
 STATE_TEXT = {WAITING: "待機中", RUNNING: "実行中", DONE: "完了", FAILED: "失敗", CANCELED: "キャンセル"}
@@ -68,6 +69,7 @@ class _Signals(QObject):
 
     progress = Signal(object, str)
     submitted = Signal(object, str)  # job, prompt_id
+    enhanced = Signal(object)  # job (AI で盛った本文が決まった)
     finished = Signal(object, object, object)  # job, outputs, error
 
 
@@ -76,22 +78,29 @@ class GenerationController(QObject):
 
     text_for(path): そのファイルの今の本文 (表示中のファイルなら編集欄の内容)。
     show_status(text): ステータスバーに 1 行出す。
+    llm_target(): AI で盛るときの (サーバーURL, LLM のモデル)。
     """
 
     jobs_changed = Signal()
     job_done = Signal(object)  # 生成が終わったジョブ (出来たファイルは job.outputs)
 
-    def __init__(self, window: QWidget, text_for: Callable[[Path], str], show_status: Callable[[str], None]):
+    def __init__(self, window: QWidget, text_for: Callable[[Path], str], show_status: Callable[[str], None],
+                 llm_target: Callable[[], tuple[str, str]]):
         super().__init__(window)
         self.window = window
         self.text_for = text_for
         self.show_status = show_status
+        self.llm_target = llm_target
         self.jobs: list[GenJob] = []
         self.job_window: Optional[JobWindow] = None
         self._signals = _Signals()
         self._signals.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
         self._signals.submitted.connect(self._on_submitted, Qt.ConnectionType.QueuedConnection)
         self._signals.finished.connect(self._on_finished, Qt.ConnectionType.QueuedConnection)
+        self._signals.enhanced.connect(lambda job: self._save_jobs(), Qt.ConnectionType.QueuedConnection)
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._refresh_job_window)
         self._saved_jobs: Optional[str] = None  # 最後に書いた内容 (変わったときだけ書く)
         # 前回終わらなかったジョブ (offer_resume で聞くまでは書き換えない)
         self._leftover, self._leftover_paused = _load_jobs()
@@ -290,6 +299,9 @@ class GenerationController(QObject):
                 prefill.workflow_path = ""
         request = dialog.request
         repeat = dialog.repeat
+        if dialog.enhancer_preset is not None:
+            # 中身は登録した時点の写しで盛る (あとでエンハンサーの設定を変えても、頼んだときの内容で)
+            request.enhancer = enhancer.snapshot(dialog.enhancer_preset, *self.llm_target())
         requests = [(source, request.copy(prompt=text.strip())) for source, text in prompts]
 
         total = len(requests) * repeat
@@ -336,6 +348,9 @@ class GenerationController(QObject):
             outputs = None
             error = None
             try:
+                req = job.request
+                if req.enhancer is not None and req.enhanced_prompt is None and (req.prompt or "").strip():
+                    self._enhance(job, signals)
                 outputs = comfy.generate(
                     job.source, job.request, lambda text: signals.progress.emit(job, text), job.cancel,
                     prompt_id, lambda new_id: signals.submitted.emit(job, new_id),
@@ -350,12 +365,54 @@ class GenerationController(QObject):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _enhance(self, job: GenJob, signals: "_Signals"):
+        """ComfyUI に送る前に、本文を AI で盛る (裏のスレッドで呼ぶ)。
+
+        ジョブごとに盛るので、回数を増やすと毎回違う盛り方になる。盛った本文はジョブに残し、
+        続きから始めるときはもう盛らない。盛れなければジョブの失敗にする (元の本文のまま送らない)。
+        """
+        signals.progress.emit(job, "AI で盛っています...")
+        box: dict = {}
+
+        def call():
+            try:
+                box["text"] = enhancer.enhance_with(job.request.enhancer, job.request.prompt)
+            except Exception as exc:  # noqa: BLE001 - 下でジョブの失敗にする
+                box["error"] = exc
+
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        while worker.is_alive():  # LLM の返事を待つ間もキャンセルできるように
+            if job.cancel.is_set():
+                raise comfy.GenerationCancelled()
+            worker.join(0.2)
+        if job.cancel.is_set():
+            raise comfy.GenerationCancelled()
+        error = box.get("error")
+        if isinstance(error, llm.LLMError):
+            raise comfy.ComfyError(f"AI で盛れませんでした。{error}")
+        if error is not None:
+            raise comfy.ComfyError(f"AI で盛れませんでした。{type(error).__name__}: {error}")
+        text = (box.get("text") or "").strip()
+        if not text:
+            raise comfy.ComfyError("AI で盛った結果が空でした。")
+        job.request = job.request.copy(enhanced_prompt=text)  # 回数ぶんのジョブで写しを共有しているので、作り直す
+        signals.enhanced.emit(job)
+        if self.paused:
+            raise comfy.GenerationHeld(sent=False)  # 盛った本文を持ったまま待機に戻り、再開を待つ
+
     def _on_progress(self, job: GenJob, text: str):
         if job.state != RUNNING:
             return  # 完了後に届いた古い進捗は無視
         job.set_status("キャンセル中..." if job.cancel.is_set() else text)
         self._show_job_status(job)
-        self._changed()
+        # 進み具合は件数も保存する内容も変えないので、ジョブ一覧を描き直すだけ (間引いて)
+        if self.job_window is not None and not self._refresh_timer.isActive():
+            self._refresh_timer.start(PROGRESS_REFRESH_MS)
+
+    def _refresh_job_window(self):
+        if self.job_window is not None:
+            self.job_window.refresh()
 
     def _on_submitted(self, job: GenJob, prompt_id: str):
         job.prompt_id = prompt_id
@@ -499,9 +556,13 @@ class GenerationController(QObject):
                 self.window, "生成時の設定", f"{path.name}\n\nこのファイルから生成した記録はありません。"
             )
             return
+        self.show_record(record, path.name)
+
+    def show_record(self, record: comfy.GenRecord, name: str = ""):
+        """記録 1 件の中身を見せる (生成結果のサムネールからは、そのファイルを作ったときの記録)。"""
         source = Path(record.source)
         current = self.text_for(source) if source.is_file() else None
-        dialog = GenInfoDialog(path.name, record, current, self.window)
+        dialog = GenInfoDialog(name or Path(record.output).name, record, current, self.window)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.regenerate:
             # 接続先・ワークフロー・長さは記録のまま、プロンプトは今のファイルの本文で
             self.generate([source], record.request)

@@ -130,12 +130,20 @@ class GenRequest:
     prompt: Optional[str] = None  # None = ワークフローに書かれているまま
     seconds: Optional[float] = None  # 同上
     base_prompt: str = ""  # 生成を始めたときのベースプロンプト (prompt のあとに改行をはさんで送る)
+    # AI で盛ってから送るときの、登録した時点のエンハンサーの写し
+    # (name・system・template・temperature・url・model)。記録から読んだものは name だけ
+    enhancer: Optional[dict] = None
+    enhanced_prompt: Optional[str] = None  # 盛ったあとの本文 (ジョブの番が来たときに決まる)
+
+    @property
+    def enhancer_name(self) -> str:
+        return str((self.enhancer or {}).get("name", ""))
 
     @property
     def full_prompt(self) -> Optional[str]:
         if self.prompt is None:
             return None
-        p = self.prompt.strip()
+        p = (self.prompt if self.enhanced_prompt is None else self.enhanced_prompt).strip()
         b = (self.base_prompt or "").strip()
         if not p:
             return b
@@ -345,6 +353,15 @@ def set_base_prompt_image(text: str) -> None:
 
 def base_prompt_for(video: bool) -> str:
     return base_prompt_video() if video else base_prompt_image()
+
+
+def use_base_prompt() -> bool:
+    """ベースプロンプトを付けて送るか (生成の画面のチェック。既定はオン)。"""
+    return load("comfy_use_base_prompt.txt") != "0"
+
+
+def set_use_base_prompt(use: bool) -> None:
+    save("comfy_use_base_prompt.txt", "1" if use else "0")
 
 
 def last_seconds() -> str:
@@ -560,6 +577,10 @@ def add_history(output: str, source: str, req: GenRequest) -> None:
         "basePrompt": req.base_prompt,
         "seconds": req.seconds,
     }
+    if req.enhancer is not None:
+        # prompt は元の本文のまま (「旧」の判定に使う)。実際に送った文は enhancedPrompt
+        record["enhancer"] = req.enhancer_name
+        record["enhancedPrompt"] = req.enhanced_prompt
     try:
         with _history_lock:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -574,42 +595,29 @@ def find_history_by_source(source: str) -> Optional[GenRecord]:
 
     同じパスの記録を探し、なければ同じファイル名の記録 (あとで別のフォルダへ移したもの) を使う。
     """
-    try:
-        with _history_lock:
-            path = file_path("comfy_history.txt")
-            if not path.is_file():
-                return None
-            lines = path.read_text(encoding="utf-8-sig").splitlines()
-    except (OSError, UnicodeDecodeError):
-        return None
-
     name = Path(source).name.lower()
     target = os.path.normcase(os.path.abspath(source))
     by_name = None
-    for line in reversed(lines):
-        if name not in line.lower():
+    for record in reversed(read_history()):
+        recorded = record.source
+        if not recorded or name not in recorded.lower():
             continue
-        try:
-            data = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(data, dict):
-            continue
-        recorded = _str(data, "source")
-        if recorded and os.path.normcase(os.path.abspath(recorded)) == target:
-            return _to_record(data)
+        if os.path.normcase(os.path.abspath(recorded)) == target:
+            return record
         if by_name is None and file_name(recorded).lower() == name:
-            by_name = data
-    return _to_record(by_name) if by_name else None
+            by_name = record
+    return by_name
 
 
-_history_cache: tuple = (None, [])  # ((パス, 更新日時, サイズ), 記録)
+# 記録は書き足す一方なので、前に読んだところから先だけを読む。
+# ((パス, ファイルの番号), 読んだバイト数, 記録)。書き換えたとき (rename_in_history) は捨てる
+_history_cache: tuple = (None, 0, [])
 
 
 def read_history() -> list[GenRecord]:
     """すべての記録 (古い順)。
 
-    テキストを選ぶたびに呼ばれるので、ファイルが変わっていなければ前に読んだものを返す。
+    テキストを選ぶたびに呼ばれるので、前に読んだものに書き足された分だけを足して返す。
     返した記録は書き換えないこと (読むだけの呼び出し元で共有している)。
     """
     global _history_cache
@@ -619,22 +627,35 @@ def read_history() -> list[GenRecord]:
             try:
                 stat = path.stat()
             except FileNotFoundError:
+                _history_cache = (None, 0, [])
                 return []
-            stamp = (str(path), stat.st_mtime_ns, stat.st_size)
-            if _history_cache[0] == stamp:
-                return list(_history_cache[1])
-            lines = path.read_text(encoding="utf-8-sig").splitlines()
-    except (OSError, UnicodeDecodeError):
+            identity = (str(path), stat.st_ino)
+            cached_identity, offset, records = _history_cache
+            if cached_identity != identity or stat.st_size < offset:
+                offset, records = 0, []  # 初めて読む・別のファイルに置き換わった・短くなった
+            if stat.st_size == offset:
+                return list(records)
+            with path.open("rb") as f:
+                f.seek(offset)
+                data = f.read()
+    except OSError:
         return []
-    records = []
-    for line in lines:
+    end = data.rfind(b"\n") + 1  # 書きかけの最後の行は、次に読む
+    if end == 0:
+        return list(records)
+    try:
+        text = data[:end].decode("utf-8-sig" if offset == 0 else "utf-8")
+    except UnicodeDecodeError:
+        return list(records)
+    records = list(records)
+    for line in text.splitlines():
         try:
-            data = json.loads(line)
+            item = json.loads(line)
         except ValueError:
             continue
-        if isinstance(data, dict):
-            records.append(_to_record(data))
-    _history_cache = (stamp, records)
+        if isinstance(item, dict):
+            records.append(_to_record(item))
+    _history_cache = (identity, offset + end, records)
     return list(records)
 
 
@@ -643,6 +664,7 @@ def rename_in_history(renames: dict[str, str]) -> int:
 
     renames は {旧パス: 新パス}。大文字小文字は区別しない。戻り値は書き換えた行の数。
     """
+    global _history_cache
     if not renames:
         return 0
     table = {os.path.normcase(os.path.abspath(old)): new for old, new in renames.items()}
@@ -681,6 +703,7 @@ def rename_in_history(renames: dict[str, str]) -> int:
                 temp = path.with_name(path.name + ".tmp")
                 temp.write_text("".join(x + "\r\n" for x in out), encoding="utf-8", newline="")
                 temp.replace(path)
+                _history_cache = (None, 0, [])  # 書き換えたので、次は読み直す
     except (OSError, UnicodeDecodeError):
         return 0
     return changed
@@ -695,6 +718,10 @@ def _to_record(data: dict) -> GenRecord:
         prompt=None if data.get("prompt") is None else str(data["prompt"]),
         base_prompt=_str(data, "basePrompt"),
     )
+    if "enhancer" in data:
+        req.enhancer = {"name": _str(data, "enhancer")}
+        if data.get("enhancedPrompt") is not None:
+            req.enhanced_prompt = str(data["enhancedPrompt"])
     if data.get("seconds") is not None:
         try:
             req.seconds = float(data["seconds"])

@@ -38,6 +38,7 @@ from . import settings as settings_module
 from . import text_io
 from .dialogs import AddTextDialog, NewFileDialog, RemoveTextDialog, RenameDialog
 from .file_list import FileListWidget
+from .enhancer import EnhancerController
 from .generation import GenerationController
 from .highlighter import TagHighlighter
 from .results_view import ResultsStrip
@@ -75,7 +76,10 @@ class MainWindow(QMainWindow):
         self.scan_timer.setSingleShot(True)
         self.scan_timer.timeout.connect(self.scan_file_list_matches)
 
-        self.generation = GenerationController(self, self.prompt_text_for, self.statusBar().showMessage)
+        self.generation = GenerationController(
+            self, self.prompt_text_for, self.statusBar().showMessage,
+            lambda: (self.translation.base_url, self.enhancer.model),  # AI で盛るときの接続先とモデル
+        )
 
         self._build_ui()
         self._restore_window_geometry()
@@ -172,10 +176,15 @@ class MainWindow(QMainWindow):
         translate_group = QGroupBox("翻訳 (AI)")
         translate_bar = QHBoxLayout(translate_group)
 
+        # エンハンサー (AI) グループ: 使うエンハンサー | 盛る | エンハンサーの設定 (同上)
+        enhance_group = QGroupBox("エンハンサー (AI)")
+        enhance_bar = QHBoxLayout(enhance_group)
+
         tool_row = QHBoxLayout()
         tool_row.addWidget(bulk_group, 1)
         tool_row.addWidget(generate_group)
         tool_row.addWidget(translate_group)
+        tool_row.addWidget(enhance_group)
         root_layout.addLayout(tool_row)
 
         # フォルダツリー + ファイル一覧 + プレビュー編集
@@ -221,6 +230,18 @@ class MainWindow(QMainWindow):
         self.translation = TranslationController(self.text_edit, self.settings_data, self)
         translate_bar.addWidget(self.translation.checkbox)
         translate_bar.addWidget(self.translation.settings_button)
+
+        # 編集欄の内容を AI で盛った結果を出す小窓 (右上。見るだけ)
+        self.enhancer = EnhancerController(
+            self.text_edit,
+            self.settings_data,
+            lambda: self.translation.base_url,
+            lambda: self.current_path.name if self.current_path else "",
+            self,
+        )
+        enhance_bar.addWidget(self.enhancer.combo)
+        enhance_bar.addWidget(self.enhancer.enhance_button)
+        enhance_bar.addWidget(self.enhancer.settings_button)
 
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
@@ -274,6 +295,7 @@ class MainWindow(QMainWindow):
         self.generation.jobs_changed.connect(self.update_jobs_button)
         self.generation.job_done.connect(self.on_generation_done)
         self.results_strip.status.connect(self.statusBar().showMessage)
+        self.results_strip.info_requested.connect(self.generation.show_record)
         jobs_shortcut = QShortcut(QKeySequence("Ctrl+J"), self)
         jobs_shortcut.activated.connect(self.generation.show_jobs)
 
@@ -294,6 +316,7 @@ class MainWindow(QMainWindow):
             "window_width": geo.width(),
             "window_height": geo.height(),
             **self.translation.settings(),
+            **self.enhancer.settings(),
         }
         settings_module.save_settings(data)
 

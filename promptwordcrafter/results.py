@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QImage, QImageReader
 
 from . import bulk_ops, comfy, text_io
@@ -341,3 +341,18 @@ def make_thumbnail(path: Path, size: int) -> Optional[QImage]:
         image = image.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
                              Qt.TransformationMode.SmoothTransformation)
     return image
+
+
+def load_preview(path: Path, width: int, height: int) -> tuple[Optional[QImage], Optional[QSize]]:
+    """width × height に収まる大きさで読む (元より大きくはしない)。元の大きさも返す (動画は None)。"""
+    if not _is_video(path):
+        reader = QImageReader(str(path))
+        reader.setAutoTransform(True)
+        original = reader.size()
+        if original.isValid() and original.width() > 0 and original.height() > 0:
+            if original.width() > width or original.height() > height:
+                reader.setScaledSize(original.scaled(width, height, Qt.AspectRatioMode.KeepAspectRatio))
+            image = reader.read()
+            if not image.isNull():
+                return image, original
+    return make_thumbnail(path, min(width, height)), None

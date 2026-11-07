@@ -7,11 +7,6 @@
 訳す向きは AI に判別させる (日本語以外 → 日本語、日本語 → 英語)。
 """
 
-import json
-import re
-import threading
-import urllib.error
-import urllib.request
 from collections import OrderedDict
 from typing import Optional
 
@@ -35,12 +30,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import llm
+from .llm import list_models
+from .llm import run_in_thread as _run_in_thread
+
 # ---- 既定値 (TranslateText と同じ) ----
 DEFAULT_BASE_URL = "http://192.168.11.6:1234/v1"
 DEFAULT_MODEL = "qwen2.5-14b-instruct-uncensored"
-API_KEY = "lm-studio"
 TEMPERATURE = 0.3
-REQUEST_TIMEOUT = 180  # 秒。ローカル LLM は長文だと時間がかかる
 
 DEBOUNCE_MS = 350  # ファイルを続けて切り替えたときは、止まったところだけ訳す
 CACHE_SIZE = 200  # 同じ本文はもう一度訳さない
@@ -78,76 +75,10 @@ def system_prompt(target: str = AUTO) -> str:
         return _TARGET_RULES.format(lang=TARGET_NAMES[target]) + _COMMON_RULES
     return _AUTO_RULES + _COMMON_RULES
 
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-
-
-class TranslateError(Exception):
-    pass
-
-
-# ----------------------------------------------------------------------
-# OpenAI 互換 API
-# ----------------------------------------------------------------------
-def _request(url: str, payload: Optional[dict] = None, timeout: float = REQUEST_TIMEOUT) -> dict:
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET")
-    req.add_header("Authorization", f"Bearer {API_KEY}")
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            return json.loads(res.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace").strip()
-        raise TranslateError(f"サーバーがエラーを返しました ({exc.code}) {detail[:300]}") from exc
-    except urllib.error.URLError as exc:
-        raise TranslateError(f"サーバーに接続できません: {exc.reason}") from exc
-    except (OSError, ValueError) as exc:
-        raise TranslateError(str(exc)) from exc
-
 
 def translate(base_url: str, model: str, text: str, target: str = AUTO) -> str:
     """text を訳して返す。target が AUTO なら訳す向きは AI が判別する。"""
-    body = _request(
-        base_url.rstrip("/") + "/chat/completions",
-        {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt(target)},
-                {"role": "user", "content": text},
-            ],
-            "temperature": TEMPERATURE,
-        },
-    )
-    try:
-        content = body["choices"][0]["message"]["content"] or ""
-    except (KeyError, IndexError, TypeError) as exc:
-        raise TranslateError("サーバーの応答を読めませんでした。") from exc
-    # 考える過程を出すモデル (<think>...</think>) は、その部分を除く
-    return _THINK_RE.sub("", content).strip()
-
-
-def list_models(base_url: str) -> list[str]:
-    body = _request(base_url.rstrip("/") + "/models", timeout=15)
-    try:
-        return sorted(item["id"] for item in body.get("data", []))
-    except (KeyError, TypeError) as exc:
-        raise TranslateError("モデル一覧を読めませんでした。") from exc
-
-
-def _run_in_thread(func, done_signal):
-    """func() を裏のスレッドで実行し、(結果, エラー文) を done_signal で返す。"""
-
-    def work():
-        try:
-            result, error = func(), None
-        except TranslateError as exc:
-            result, error = None, str(exc)
-        except Exception as exc:  # noqa: BLE001 - 予期しない失敗も画面に出す
-            result, error = None, f"{type(exc).__name__}: {exc}"
-        done_signal.emit(result, error)
-
-    threading.Thread(target=work, daemon=True).start()
+    return llm.chat(base_url, model, system_prompt(target), text, TEMPERATURE)
 
 
 # ----------------------------------------------------------------------
@@ -403,11 +334,15 @@ class TranslationSettingsDialog(QDialog):
         if not models:
             self.status_label.setText("モデルが見つかりませんでした。")
             return
-        current = self.model_combo.currentText()
+        current = self.model_combo.currentText().strip()
+        picked = llm.pick_model(current, models)
         self.model_combo.clear()
         self.model_combo.addItems(models)
-        self.model_combo.setEditText(current)
-        self.status_label.setText(f"モデル {len(models)} 件を取得しました。")
+        self.model_combo.setEditText(picked)
+        message = f"モデル {len(models)} 件を取得しました。"
+        if picked != current:
+            message += f"「{current}」はサーバーにないので「{picked}」にしました。"
+        self.status_label.setText(message)
 
     def test_connection(self):
         url, model = self.base_url(), self.model()

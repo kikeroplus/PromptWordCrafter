@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import comfy
+from . import comfy, enhancer
 
 OK_COLOR = "#2e7d32"
 ERROR_COLOR = "#b71c1c"
@@ -497,7 +497,7 @@ class GenerateDialog(QDialog):
     プロンプトはテキストファイルの本文そのもの。この画面では見せるだけで、書き換えない。
     prompts: 対象の (ファイル名, 本文) の並び。
     prefill: 欄の初期値 (「生成時の設定」から開いたときや、「生成の設定...」から戻ったとき)。
-    プロンプトは持たない。接続先・ワークフロー・長さだけを使う。
+    プロンプトは持たない。接続先・ワークフロー・長さ・エンハンサーだけを使う。
     """
 
     def __init__(self, title: str, prompts: list[tuple[str, str]],
@@ -509,6 +509,7 @@ class GenerateDialog(QDialog):
         self.batch = len(prompts) > 1
         self.request: Optional[comfy.GenRequest] = None
         self.repeat = 1
+        self.enhancer_preset: Optional[enhancer.EnhancerPreset] = None  # AI で盛ってから送るときのエンハンサー
         self.reopen: Optional[comfy.GenRequest] = None  # 「生成の設定...」を押して閉じたときの各欄の内容
         self._base_prompt = ""
         self._integer_seconds = False
@@ -606,10 +607,31 @@ class GenerateDialog(QDialog):
             self.prompt_label.setText(f"プロンプト ({prompts[0][0]} の本文。書き換えるときは編集欄で)")
             self.prompt_view.setPlainText(prompts[0][1])
         layout.addWidget(self.prompt_view)
-        self.base_hint = QLabel()
-        self.base_hint.setStyleSheet(f"color: {HINT_COLOR};")
-        self.base_hint.hide()
-        layout.addWidget(self.base_hint)
+        # 付け足すベースプロンプト。外すと、ベースプロンプトなしで送る (前回の状態を覚える)
+        self.base_check = QCheckBox()
+        self.base_check.setChecked(comfy.use_base_prompt())
+        self.base_check.hide()
+        layout.addWidget(self.base_check)
+
+        # エンハンサー (本文を AI で盛ってから送る。登録は「エンハンサー (AI)」の「設定」で)
+        self._enhancers = enhancer.load_presets()
+        self._enhancer_index = [-1]  # 欄の行 → エンハンサーの番号 (なしは -1)
+        enhancer_row = QHBoxLayout()
+        enhancer_row.addWidget(QLabel("エンハンサー"))
+        self.enhancer_box = QComboBox()
+        self.enhancer_box.setMaxVisibleItems(20)
+        self.enhancer_box.addItem("なし (本文をそのまま送る)")
+        for i, preset in enumerate(self._enhancers):
+            if not preset.is_empty:
+                self.enhancer_box.addItem(preset.label(i))
+                self._enhancer_index.append(i)
+        enhancer_row.addWidget(self.enhancer_box, 1)
+        layout.addLayout(enhancer_row)
+        self.enhancer_hint = _hint("")
+        layout.addWidget(self.enhancer_hint)
+        self._enhancer_note = ""  # 記録のエンハンサーが見つからなかったときの知らせ
+        self._select_enhancer(enhancer.last_generate_index())
+        self.enhancer_box.currentIndexChanged.connect(self._show_enhancer_hint)
 
         # 長さ・回数
         seconds_row = QHBoxLayout()
@@ -678,6 +700,8 @@ class GenerateDialog(QDialog):
                 prefill.url, prefill.workflow_path,
                 "" if prefill.seconds is None else comfy.format_seconds(prefill.seconds),
             )
+            self._apply_enhancer(prefill.enhancer)
+        self._show_enhancer_hint()
 
         if self.seconds_edit.isEnabled():
             self.seconds_edit.setFocus()
@@ -699,6 +723,42 @@ class GenerateDialog(QDialog):
         if self.seconds_edit.isEnabled() and _parse_seconds(seconds) is not None:
             self.seconds_edit.setText(seconds.strip())
 
+    def _select_enhancer(self, index: int) -> bool:
+        if index in self._enhancer_index:
+            self.enhancer_box.setCurrentIndex(self._enhancer_index.index(index))
+            return True
+        self.enhancer_box.setCurrentIndex(0)
+        return False
+
+    def _apply_enhancer(self, snap: Optional[dict]):
+        """記録や入力中の内容のエンハンサーを選ぶ。番号が分かればそれ、なければ名前で探す。"""
+        self._enhancer_note = ""
+        if snap is None:
+            self._select_enhancer(-1)
+            return
+        index = snap.get("index")
+        if isinstance(index, int) and self._select_enhancer(index):
+            return
+        name = str(snap.get("name", ""))
+        found = next((i for i, p in enumerate(self._enhancers) if name and p.name == name and not p.is_empty), -1)
+        self._select_enhancer(found)
+        if found < 0:
+            self._enhancer_note = f"記録のエンハンサー「{name}」は登録にないので、「なし」にしました。"
+
+    def _current_enhancer(self) -> int:
+        return self._enhancer_index[max(self.enhancer_box.currentIndex(), 0)]
+
+    def _show_enhancer_hint(self):
+        if self._current_enhancer() >= 0:
+            self._enhancer_note = ""
+            self.enhancer_hint.setText(
+                "本文を AI で盛ってから送ります (ベースプロンプトは盛りません)。"
+                "ジョブの番が来るたびに盛るので、回数を増やすと毎回違う盛り方になります。"
+            )
+        else:
+            self.enhancer_hint.setText(self._enhancer_note)
+        self.enhancer_hint.setVisible(bool(self.enhancer_hint.text()))
+
     def _fields(self) -> comfy.GenRequest:
         """今の各欄の内容 (長さは、使えないときや正しくないときは None)。1 件のときは本文も入れる。"""
         sel = max(self.conn_box.currentIndex(), 0)
@@ -711,6 +771,9 @@ class GenerateDialog(QDialog):
             r.prompt = self.prompts[0][1]
         if self.seconds_edit.isEnabled():
             r.seconds = _parse_seconds(self.seconds_edit.text())
+        index = self._current_enhancer()
+        if index >= 0:
+            r.enhancer = {"name": self._enhancers[index].name, "index": index}
         return r
 
     def _apply_workflow(self):
@@ -746,9 +809,11 @@ class GenerateDialog(QDialog):
         self._base_prompt = comfy.base_prompt_for(video) if ok else ""
         kind = "動画用" if video else "画像用"
         one_line = self._base_prompt.replace("\r", "").replace("\n", " ")
-        self.base_hint.setText(_shorten(f"＋ ベースプロンプト ({kind}) : {one_line}", 90))
-        self.base_hint.setToolTip(self._base_prompt)
-        self.base_hint.setVisible(bool(self._base_prompt))
+        self.base_check.setText(_shorten(f"＋ ベースプロンプト ({kind}) : {one_line}", 90))
+        self.base_check.setToolTip(
+            self._base_prompt + "\n\n(チェックを外すと、ベースプロンプトを付けずに送ります)"
+        )
+        self.base_check.setVisible(bool(self._base_prompt))
 
         has_seconds = wf_seconds is not None
         if has_seconds and _parse_seconds(self.seconds_edit.text()) is None:
@@ -810,6 +875,7 @@ class GenerateDialog(QDialog):
     # --- ボタン -------------------------------------------------------
     def _open_settings(self):
         self.reopen = self._fields()
+        comfy.set_use_base_prompt(self.base_check.isChecked())  # 開き直したときも同じ状態に
         self.reject()
 
     def _paste(self):
@@ -851,7 +917,8 @@ class GenerateDialog(QDialog):
             return
 
         # プロンプトは呼び出し側がファイルごとの本文を入れる。ここではベースプロンプトまで
-        request = comfy.GenRequest(base_prompt=self._base_prompt)
+        use_base = self.base_check.isChecked()
+        request = comfy.GenRequest(base_prompt=self._base_prompt if use_base else "")
         if self.seconds_edit.isEnabled():
             seconds = _parse_seconds(self.seconds_edit.text())
             if seconds is None or (self._integer_seconds and seconds != int(seconds)):
@@ -872,6 +939,10 @@ class GenerateDialog(QDialog):
         request.workflow_name = self._wf_name[wf]
         comfy.set_active_workflow(self._wf_index[wf])
         comfy.set_last_set(self.set_box.currentIndex())
+        index = self._current_enhancer()
+        self.enhancer_preset = self._enhancers[index] if index >= 0 else None
+        enhancer.set_last_generate_index(index)
+        comfy.set_use_base_prompt(use_base)
         self.request = request
         self.repeat = repeat
         self.accept()
@@ -1079,6 +1150,8 @@ class GenInfoDialog(QDialog):
         row("ワークフロー", req.workflow_path if not req.workflow_name or same_name
             else f"{req.workflow_name}  ({req.workflow_path})")
         row("長さ", "(ワークフローのまま)" if req.seconds is None else f"{comfy.format_seconds(req.seconds)} 秒")
+        if req.enhancer is not None:
+            row("エンハンサー", req.enhancer_name or "(名前なし)")
         layout.addLayout(form)
 
         layout.addWidget(QLabel("プロンプト (送ったファイルの本文)" if req.prompt is not None
@@ -1089,6 +1162,12 @@ class GenInfoDialog(QDialog):
         layout.addWidget(prompt)
         if current_text is not None and req.prompt is not None and current_text.strip() != req.prompt.strip():
             layout.addWidget(_hint("※ ファイルの本文は、このあと書き換えられています。やり直すときは今の本文を使います。"))
+        if req.enhanced_prompt is not None:
+            layout.addWidget(QLabel("AI で盛ったプロンプト (実際に送った文。このあとにベースプロンプトを付けて送りました)"))
+            enhanced = QPlainTextEdit(req.enhanced_prompt)
+            enhanced.setReadOnly(True)
+            enhanced.setFixedHeight(120)
+            layout.addWidget(enhanced)
         if req.base_prompt:
             layout.addWidget(QLabel("ベースプロンプト (プロンプトのあとに続けて送りました)"))
             base = QPlainTextEdit(req.base_prompt)
@@ -1104,7 +1183,10 @@ class GenInfoDialog(QDialog):
         bottom.addStretch(1)
         again = QPushButton("この設定で生成する...")
         again.setEnabled(has_source)
-        again.setToolTip("今のファイルの本文で、同じ接続先・ワークフロー・長さでもう一度生成します (seed は変わります)")
+        again.setToolTip(
+            "今のファイルの本文で、同じ接続先・ワークフロー・長さ・エンハンサーでもう一度生成します"
+            " (seed は変わります。エンハンサーを使ったときは、盛り直します)"
+        )
         again.clicked.connect(self._again)
         close = QPushButton("閉じる")
         close.setDefault(True)
