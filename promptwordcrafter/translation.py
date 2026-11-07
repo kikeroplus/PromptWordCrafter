@@ -4,6 +4,8 @@
 訳はファイルに書き込まない。
 
 接続先は TranslateText (translate_gui.py) と同じ LM Studio (OpenAI 互換 API)。
+サーバーURL はエンハンサー・読み取りと同じもの (3 つのアプリで共有。gencommon.settings)。
+モデルは翻訳用に別に選ぶ (promptwordcrafter_settings.json の translate_model)。
 訳す向きは AI に判別させる (日本語以外 → 日本語、日本語 → 英語)。
 """
 
@@ -30,12 +32,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import llm
-from .llm import list_models
-from .llm import run_in_thread as _run_in_thread
+from gencommon import llm, settings as shared
+from gencommon.llm import list_models
+from gencommon.llm import run_in_thread as _run_in_thread
 
 # ---- 既定値 (TranslateText と同じ) ----
-DEFAULT_BASE_URL = "http://192.168.11.6:1234/v1"
+DEFAULT_BASE_URL = shared.DEFAULT_LLM_URL
 DEFAULT_MODEL = "qwen2.5-14b-instruct-uncensored"
 TEMPERATURE = 0.3
 
@@ -293,6 +295,7 @@ class TranslationSettingsDialog(QDialog):
         layout.addLayout(test_row)
 
         note = QLabel(
+            "サーバーURL はエンハンサー・読み取りと同じものです (J-Rate・ImageMimicArt とも共有)。\n"
             "訳す向きはふだん AI が判別します (日本語以外 → 日本語、日本語 → 英語)。\n"
             "小窓の「日本語に」「英語に」を押すと、訳す先をはっきり指示します。"
         )
@@ -370,7 +373,6 @@ class TranslationController(QObject):
     def __init__(self, editor: QTextEdit, settings_data: dict, parent: QWidget):
         super().__init__(parent)
         self.parent_widget = parent
-        self.base_url = settings_data.get("translate_url") or DEFAULT_BASE_URL
         self.model = settings_data.get("translate_model") or DEFAULT_MODEL
         target = settings_data.get("translate_target", AUTO)
         self.target = target if target in TARGET_NAMES else AUTO
@@ -403,10 +405,14 @@ class TranslationController(QObject):
     def enabled(self) -> bool:
         return self.checkbox.isChecked()
 
+    @property
+    def base_url(self) -> str:
+        """サーバーURL (共有。ほかのアプリで変えたものもすぐ使う)。"""
+        return shared.llm_url()
+
     def settings(self) -> dict:
         return {
             "translate_enabled": self.enabled,
-            "translate_url": self.base_url,
             "translate_model": self.model,
             "translate_target": self.target,
         }
@@ -501,7 +507,8 @@ class TranslationController(QObject):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         changed = (dialog.base_url(), dialog.model()) != (self.base_url, self.model)
-        self.base_url, self.model = dialog.base_url(), dialog.model()
+        shared.set_llm_url(dialog.base_url())
+        self.model = dialog.model()
         if changed:
             self._cache.clear()
             if self.enabled and self._want is not None:

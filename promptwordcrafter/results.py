@@ -17,11 +17,13 @@ from typing import Optional
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QImage, QImageReader
 
-from . import bulk_ops, comfy, text_io
+from gencommon import comfy
+
+from . import bulk_ops, text_io
+from .profile import SUFFIXES
 
 MOVIE_EXTS = {".mp4", ".m4v", ".webm", ".mov", ".mkv"}
 MEDIA_EXTS = MOVIE_EXTS | {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-SUFFIXES = ("_t2i", "_video")
 
 
 @dataclass

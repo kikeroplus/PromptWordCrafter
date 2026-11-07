@@ -32,6 +32,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gencommon.generation import GenerationController
+
 from . import bulk_ops
 from . import results
 from . import settings as settings_module
@@ -39,7 +41,6 @@ from . import text_io
 from .dialogs import AddTextDialog, NewFileDialog, RemoveTextDialog, RenameDialog
 from .file_list import FileListWidget
 from .enhancer import EnhancerController
-from .generation import GenerationController
 from .highlighter import TagHighlighter
 from .results_view import ResultsStrip
 from .translation import TranslationController
@@ -76,10 +77,7 @@ class MainWindow(QMainWindow):
         self.scan_timer.setSingleShot(True)
         self.scan_timer.timeout.connect(self.scan_file_list_matches)
 
-        self.generation = GenerationController(
-            self, self.prompt_text_for, self.statusBar().showMessage,
-            lambda: (self.translation.base_url, self.enhancer.model),  # AI で盛るときの接続先とモデル
-        )
+        self.generation = GenerationController(self, self.prompt_text_for, self.statusBar().showMessage)
 
         self._build_ui()
         self._restore_window_geometry()
@@ -234,8 +232,6 @@ class MainWindow(QMainWindow):
         # 編集欄の内容を AI で盛った結果を出す小窓 (右上。見るだけ)
         self.enhancer = EnhancerController(
             self.text_edit,
-            self.settings_data,
-            lambda: self.translation.base_url,
             lambda: self.current_path.name if self.current_path else "",
             self,
         )
@@ -316,7 +312,6 @@ class MainWindow(QMainWindow):
             "window_width": geo.width(),
             "window_height": geo.height(),
             **self.translation.settings(),
-            **self.enhancer.settings(),
         }
         settings_module.save_settings(data)
 

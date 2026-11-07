@@ -5,6 +5,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
+from . import profile
 from .icon import make_icon
 from .main_window import MainWindow
 
@@ -54,9 +55,12 @@ def main():
     if _notify_running_instance():
         sys.exit(0)
     app.setWindowIcon(make_icon())
+    merged = profile.setup()  # 設定の置き場所を決め、初めてなら共有の設定に移す
     window = MainWindow()
     _start_server(window)
     window.show()
+    if merged:
+        window.statusBar().showMessage("共有の設定: " + "。".join(merged))
     sys.exit(app.exec())
 
 
