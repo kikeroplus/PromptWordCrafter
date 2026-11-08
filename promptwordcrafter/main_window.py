@@ -169,6 +169,11 @@ class MainWindow(QMainWindow):
         generate_bar.addWidget(self.jobs_button)
         self.generate_settings_button = QPushButton("生成の設定")
         generate_bar.addWidget(self.generate_settings_button)
+        self.diagram_settings_button = QPushButton("図で設定")
+        self.diagram_settings_button.setToolTip(
+            "設定・処理・送る前の確認を図のように並べた画面で、次に生成するときの設定を決めます (生成はしません)"
+        )
+        generate_bar.addWidget(self.diagram_settings_button)
 
         # 翻訳 (AI) グループ: 翻訳する | 翻訳の設定 (部品は編集欄を作った後に入れる)
         translate_group = QGroupBox("翻訳 (AI)")
@@ -288,6 +293,7 @@ class MainWindow(QMainWindow):
         self.generate_button.clicked.connect(self.generate_selected)
         self.jobs_button.clicked.connect(self.generation.show_jobs)
         self.generate_settings_button.clicked.connect(self.generation.show_settings)
+        self.diagram_settings_button.clicked.connect(self.diagram_settings)
         self.generation.jobs_changed.connect(self.update_jobs_button)
         self.generation.job_done.connect(self.on_generation_done)
         self.results_strip.status.connect(self.statusBar().showMessage)
@@ -948,6 +954,13 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("生成するテキストファイルを選択してください。")
             return
         self.generation.generate(sources, what="選択中のファイル")
+
+    def diagram_settings(self):
+        """「図で設定」: 選択中 (なければ表示中) のテキストの本文で、送る前の確認を見せる。"""
+        sources = self.selected_files()
+        if not sources and self.current_path is not None:
+            sources = [self.current_path]
+        self.generation.show_diagram_settings(sources)
 
     def generate_all(self):
         self.generation.generate(list(self.files), what="一覧のファイル")
