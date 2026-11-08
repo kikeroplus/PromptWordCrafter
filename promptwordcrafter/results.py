@@ -1,7 +1,8 @@
 """プロンプトのテキストファイルと、そこから生成した画像・動画の結び付け。
 
 結び付けは生成の記録 (comfy_history.txt) を正にし、記録のないものはファイル名
-「(テキストの名前)_t2i*.png」「(テキストの名前)_video*.mp4」で拾う。
+「(テキストの名前)_t2i*.png」「(テキストの名前)_video*.mp4」で拾う (「生成結果」フォルダと、
+前の置き場所だったテキストと同じフォルダの両方)。
 記録に残っている本文と今の本文を比べ、前の本文で作ったものには印を付ける。
 """
 
@@ -20,7 +21,7 @@ from PySide6.QtGui import QImage, QImageReader
 from gencommon import comfy
 
 from . import bulk_ops, text_io
-from .profile import SUFFIXES
+from .profile import SUFFIXES, results_dir
 
 MOVIE_EXTS = {".mp4", ".m4v", ".webm", ".mov", ".mkv"}
 MEDIA_EXTS = MOVIE_EXTS | {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -80,7 +81,7 @@ def find_results(source: Path, current_text: str, records: Optional[list] = None
             mine = (
                 bool(record.source)
                 and record.request.prompt is not None
-                and Path(output).parent == source.parent
+                and _key(Path(output).parent) in (_key(source.parent), _key(results_dir(source)))
                 and _same_text(record.request.prompt, current_text)
                 and not Path(record.source).exists()
             )
@@ -92,13 +93,14 @@ def find_results(source: Path, current_text: str, records: Optional[list] = None
         old = record.request.prompt is not None and not _same_text(record.request.prompt, current_text)
         found[key] = ResultFile(path, _is_video(path), old, _mtime(path), record)
 
-    try:
-        pattern = _name_pattern(source.stem)
-        for path in source.parent.iterdir():
-            if path.suffix.lower() in MEDIA_EXTS and pattern.match(path.name) and _key(path) not in found:
-                found[_key(path)] = ResultFile(path, _is_video(path), False, _mtime(path))
-    except OSError:
-        pass
+    pattern = _name_pattern(source.stem)
+    for folder in (results_dir(source), source.parent):  # 前はテキストと同じフォルダに置いていた
+        try:
+            for path in folder.iterdir():
+                if path.suffix.lower() in MEDIA_EXTS and pattern.match(path.name) and _key(path) not in found:
+                    found[_key(path)] = ResultFile(path, _is_video(path), False, _mtime(path))
+        except OSError:
+            pass
 
     return sorted(found.values(), key=lambda r: r.time, reverse=True)
 
@@ -143,6 +145,18 @@ def rename_results(plan: list[tuple[Path, Path]]) -> tuple[int, list[str]]:
 
     # 入れ替え (a↔b) でぶつからないよう、いったん一時名にしてから付ける
     errors = []
+    # 「生成結果」フォルダの結果に付いている説明の .txt (ImageMimicArt などが書いたもの) も、結果に合わせて付け替える
+    caption_temps: dict[str, Path] = {}
+    for index, (src, _dst) in enumerate(moves):
+        caption = src.with_suffix(CAPTION_EXT)
+        if src.parent.name.lower() != text_io.RESULTS_DIR.lower() or not caption.is_file():
+            continue
+        temp = caption.with_name(f"__pwc_rename_tmp_{index}__{caption.name}")
+        try:
+            caption.rename(temp)
+            caption_temps[str(src)] = temp
+        except OSError as exc:
+            errors.append(f"{caption.name}: {exc}")
     temps = []
     for index, (src, _dst) in enumerate(moves):
         temp = src.with_name(f"__pwc_rename_tmp_{index}__{src.name}")
@@ -171,8 +185,96 @@ def rename_results(plan: list[tuple[Path, Path]]) -> tuple[int, list[str]]:
             except OSError:
                 pass
 
+    for src_text, temp in caption_temps.items():
+        src = Path(src_text)
+        final = Path(output_renames.get(src_text, src_text)).with_suffix(CAPTION_EXT)
+        if final.exists():
+            final = src.with_suffix(CAPTION_EXT)  # 行き先がふさがっていれば元の名前に戻す
+        try:
+            temp.rename(final)
+        except OSError as exc:
+            errors.append(f"{final.name}: {exc}")
+
     comfy.rename_in_history({**text_renames, **output_renames})
+    for app_name in READER_APPS:
+        comfy.rename_in_history(output_renames, app_name)  # 結果を元画像にした記録
     return len(output_renames), errors
+
+
+# ----------------------------------------------------------------------
+# 前の置き場所 (テキストと同じフォルダ) にある結果を「生成結果」フォルダへ移す
+# ----------------------------------------------------------------------
+READER_APPS = ("ImageMimicArt",)  # 結果の画像を元画像にして、記録に元のパスを残すアプリ
+CAPTION_EXT = ".txt"
+
+
+def old_place_results(folder: Path) -> list[Path]:
+    """folder のテキストから生成して、まだ folder に置いてある結果 (名前順)。"""
+    records = comfy.read_history()
+    found: dict[str, Path] = {}
+    for source in text_io.list_text_files(folder):
+        try:
+            text, _encoding = text_io.read_text(source)
+        except OSError:
+            text = ""
+        for result in find_results(source, text, records):
+            if _key(result.path.parent) == _key(folder):
+                found[_key(result.path)] = result.path
+    return sorted(found.values(), key=lambda p: p.name.lower())
+
+
+def move_to_results_dir(folder: Path, paths: list[Path]) -> tuple[int, int, list[str]]:
+    """結果のファイルを folder\生成結果 へ移す。同じ名前の説明の .txt (ImageMimicArt などが書いたもの) も一緒に。
+
+    同じ名前の別の画像 (photo.png に対する photo.jpg) が folder に残るときは、その .txt は残す。
+    記録 (このアプリと、結果を元画像にしたアプリ) のパスも付け替える。
+    戻り値: (移した結果の数, 移した .txt の数, 失敗の説明)。
+    """
+    target_dir = folder / text_io.RESULTS_DIR
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return 0, 0, [f"{target_dir}: {exc}"]
+    moving = {_key(p) for p in paths}
+    renames: dict[str, str] = {}
+    errors: list[str] = []
+    captions = 0
+    for path in paths:
+        dest = target_dir / path.name
+        i = 2
+        while dest.exists():
+            dest = target_dir / f"{path.stem} ({i}){path.suffix}"
+            i += 1
+        try:
+            path.rename(dest)
+        except OSError as exc:
+            errors.append(f"{path.name}: {exc}")
+            continue
+        renames[str(path)] = str(dest)
+
+        caption = path.with_suffix(CAPTION_EXT)
+        if not caption.is_file():
+            continue
+        shared = [other for other in folder.glob(glob_escape(path.stem) + ".*")
+                  if other.suffix.lower() in MEDIA_EXTS and _key(other) not in moving and other.is_file()]
+        caption_dest = dest.with_suffix(CAPTION_EXT)
+        if shared or caption_dest.exists():
+            continue
+        try:
+            caption.rename(caption_dest)
+            captions += 1
+        except OSError as exc:
+            errors.append(f"{caption.name}: {exc}")
+
+    comfy.rename_in_history(renames)
+    for app_name in READER_APPS:
+        comfy.rename_in_history(renames, app_name)
+    return len(renames), captions, errors
+
+
+def glob_escape(text: str) -> str:
+    """glob の特殊文字 ([ ] * ?) をそのままの文字として扱う。"""
+    return "".join(f"[{c}]" if c in "[]*?" else c for c in text)
 
 
 # ----------------------------------------------------------------------

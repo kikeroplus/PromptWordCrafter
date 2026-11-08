@@ -996,9 +996,46 @@ class MainWindow(QMainWindow):
         generate_all = menu.addAction("サブフォルダも含めてまとめて生成する...")
         generate_all.triggered.connect(lambda: self.generate_folder(folder, recursive=True))
         menu.addSeparator()
+        # 数えるのは選んだときにする (テキストごとに結果を探すので、右クリックのたびには重い)
+        move = menu.addAction(f"このフォルダの生成結果を「{text_io.RESULTS_DIR}」フォルダへ移す...")
+        move.triggered.connect(lambda: self.move_old_results(folder))
+        menu.addSeparator()
         explorer = menu.addAction("エクスプローラーで開く")
         explorer.triggered.connect(lambda: os.startfile(str(folder)))
         menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
+
+    def move_old_results(self, folder: Path):
+        """前の置き場所 (テキストと同じフォルダ) にある生成結果を「生成結果」フォルダへ移す。"""
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            paths = results.old_place_results(folder)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not paths:
+            self.statusBar().showMessage(f"フォルダ「{folder.name or folder}」に移す生成結果はありません。")
+            return
+        text = (
+            f"フォルダ「{folder.name or folder}」にある生成結果 {len(paths)} 個を、"
+            f"「{text_io.RESULTS_DIR}」フォルダへ移しますか？\n\n"
+            "結果と同じ名前の .txt (ImageMimicArt などで読み取った説明) も一緒に移し、"
+            "生成の記録 (PromptWordCrafter と ImageMimicArt) も付け替えます。\n"
+            "ImageMimicArt で生成中のときは、終わってから移してください。"
+        )
+        if QMessageBox.question(self, "生成結果を移す", text) != QMessageBox.StandardButton.Yes:
+            return
+        reload = results.same_path(folder, Path(self.folder_edit.text()).expanduser())
+        if reload and not self.confirm_save_changes():
+            return
+        moved, captions, errors = results.move_to_results_dir(folder, paths)
+        if reload:
+            current = self.current_path
+            self.load_folder(confirm=False)
+            if current is not None and current in self.files:
+                self.file_list.setCurrentRow(self.files.index(current))
+        message = f"生成結果 {moved} 個と説明の .txt {captions} 個を「{text_io.RESULTS_DIR}」フォルダへ移しました。"
+        if errors:
+            QMessageBox.warning(self, "生成結果を移す", message + "\n\n移せなかったもの:\n" + "\n".join(errors[:20]))
+        self.statusBar().showMessage(message)
 
     def update_jobs_button(self):
         active = self.generation.active_count

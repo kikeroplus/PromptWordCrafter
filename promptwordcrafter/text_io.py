@@ -22,6 +22,10 @@ TEXT_EXTENSIONS = {
     ".yaml",
 }
 
+# 生成結果を入れるサブフォルダ (テキストのフォルダの中)。プロンプトのフォルダには手で作ったテキストだけを置き、
+# 結果の画像と、それを元に ImageMimicArt などが書く説明の .txt はここに集める
+RESULTS_DIR = "生成結果"
+
 ENCODINGS = ("utf-8-sig", "utf-8", "cp932", "utf-16", "latin-1")
 
 
@@ -33,7 +37,7 @@ def list_text_files(folder: Path, recursive: bool = False) -> list[Path]:
     """folder のテキストファイル (一覧と同じ判定) を名前順に返す。
 
     recursive のときはサブフォルダもたどる (フォルダごとに、そのフォルダのファイル → サブフォルダの順)。
-    読めないフォルダと、"." で始まる隠しフォルダは飛ばす。
+    読めないフォルダと、"." で始まる隠しフォルダと、生成結果のフォルダ (中の .txt は画像の説明) は飛ばす。
     """
     try:
         entries = sorted(folder.iterdir(), key=lambda item: item.name.lower())
@@ -42,7 +46,8 @@ def list_text_files(folder: Path, recursive: bool = False) -> list[Path]:
     files = [path for path in entries if is_text_file(path)]
     if recursive:
         for path in entries:
-            if path.is_dir() and not path.is_symlink() and not path.name.startswith("."):
+            if (path.is_dir() and not path.is_symlink() and not path.name.startswith(".")
+                    and path.name.lower() != RESULTS_DIR.lower()):
                 files.extend(list_text_files(path, recursive=True))
     return files
 
