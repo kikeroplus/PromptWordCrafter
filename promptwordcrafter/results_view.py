@@ -16,12 +16,14 @@ from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QImage, QPainte
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QHBoxLayout,
     QLabel,
     QListView,
     QListWidget,
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -265,8 +267,15 @@ class ResultsStrip(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(2)
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
         self.header = QLabel()
-        layout.addWidget(self.header)
+        header_row.addWidget(self.header, 1)
+        self.refresh_button = QPushButton("更新")
+        self.refresh_button.setToolTip("フォルダの中を見直して、生成結果の一覧を作り直します (他のアプリで足した・消したファイルも反映)")
+        self.refresh_button.clicked.connect(lambda: self.refresh())
+        header_row.addWidget(self.refresh_button)
+        layout.addLayout(header_row)
         self.list = _ResultList(self)
         layout.addWidget(self.list)
 
@@ -297,6 +306,7 @@ class ResultsStrip(QWidget):
         self._items.clear()
         self._records.clear()
         self.header.setText("生成結果")
+        self.refresh_button.setEnabled(False)
 
     def show_for(self, source: Optional[Path], text: str):
         """そのテキストの生成結果を出す。同じテキストなら選択とスクロール位置を残す。"""
@@ -308,6 +318,7 @@ class ResultsStrip(QWidget):
         scroll = self.list.horizontalScrollBar().value() if same else 0
         self.source = source
         self._text = text
+        self.refresh_button.setEnabled(True)
 
         found = results.find_results(source, text)
         self._rebuilding = True  # 作り直しの間に「表示中」が動いても小窓は追わない

@@ -105,6 +105,9 @@ class MainWindow(QMainWindow):
         self.browse_button = QPushButton("選択")
         folder_bar.addWidget(self.browse_button)
         self.refresh_button = QPushButton("更新")
+        self.refresh_button.setToolTip(
+            "フォルダツリー・ファイル一覧・生成結果を読み直します (F5)。表示中のファイルはそのまま選んでおきます"
+        )
         folder_bar.addWidget(self.refresh_button)
         root_layout.addLayout(folder_bar)
 
@@ -193,13 +196,9 @@ class MainWindow(QMainWindow):
         # フォルダツリー + ファイル一覧 + プレビュー編集
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        self.folder_tree_model = QFileSystemModel(self)
-        self.folder_tree_model.setFilter(QDir.Filter.AllDirs | QDir.Filter.NoDotAndDotDot)
         self.folder_tree = FolderTreeView()
-        self.folder_tree.setModel(self.folder_tree_model)
+        self._set_tree_model()
         self.folder_tree.setHeaderHidden(True)
-        for column in range(1, 4):
-            self.folder_tree.hideColumn(column)
         self.folder_tree.header().setStretchLastSection(False)
         # ResizeToContents だと、表示中の行が変わるたびに列幅（＝横スクロールの
         # 基準）が再計算されてしまい、選び直すたびに横スクロール位置がずれる
@@ -234,7 +233,7 @@ class MainWindow(QMainWindow):
         translate_bar.addWidget(self.translation.checkbox)
         translate_bar.addWidget(self.translation.settings_button)
 
-        # 編集欄の内容を AI で盛った結果を出す小窓 (右上。見るだけ)
+        # 編集欄の内容 (元のプロンプト) を AI で盛ったプロンプトを出す小窓 (右上。見るだけ)
         self.enhancer = EnhancerController(
             self.text_edit,
             lambda: self.current_path.name if self.current_path else "",
@@ -264,7 +263,9 @@ class MainWindow(QMainWindow):
     def _connect_signals(self):
         self.folder_edit.returnPressed.connect(lambda: self.load_folder())
         self.browse_button.clicked.connect(self.choose_folder)
-        self.refresh_button.clicked.connect(lambda: self.load_folder())
+        self.refresh_button.clicked.connect(self.refresh_folder)
+        refresh_shortcut = QShortcut(QKeySequence("F5"), self)
+        refresh_shortcut.activated.connect(self.refresh_folder)
 
         self.search_edit.textChanged.connect(self.on_search_text_changed)
         self.search_edit.returnPressed.connect(self.search_text_and_focus)
@@ -286,7 +287,6 @@ class MainWindow(QMainWindow):
         self.delete_bak_button.clicked.connect(self.remove_bak_files)
         self.reformat_button.clicked.connect(self.reformat_current_file)
 
-        self.folder_tree.selectionModel().currentChanged.connect(self.on_tree_current_changed)
         self.folder_tree.customContextMenuRequested.connect(self.show_folder_menu)
 
         self.file_list.customContextMenuRequested.connect(self.show_file_menu)
@@ -342,7 +342,18 @@ class MainWindow(QMainWindow):
         self.folder_edit.setText(folder)
         self.load_folder(confirm=False)
 
-    def load_folder(self, confirm: bool = True):
+    def refresh_folder(self):
+        """「更新」: ツリーを作り直し、一覧と生成結果を読み直す。表示中のファイルは選び直す。"""
+        if not self.confirm_save_changes():
+            return
+        keep = self.current_path
+        # QFileSystemModel は一度読んだフォルダを覚えていて、外で足した・消したフォルダを
+        # 拾いそこねることがあるので、モデルごと作り直す。
+        self._set_tree_model()
+        self._tree_root = None
+        self.load_folder(confirm=False, keep=keep)
+
+    def load_folder(self, confirm: bool = True, keep: Optional[Path] = None):
         if confirm and not self.confirm_save_changes():
             return
 
@@ -377,7 +388,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{len(self.files)} 件のテキストファイルを表示しています。")
         self.generate_button.setEnabled(bool(self.files))
         if self.files:
-            self.file_list.setCurrentRow(0)
+            row = next((i for i, p in enumerate(self.files) if keep is not None and results.same_path(p, keep)), 0)
+            self.file_list.setCurrentRow(row)
+            self.file_list.scrollToItem(self.file_list.item(row))
             self.file_list.setFocus()
         self.scan_file_list_matches()
         self.save_settings()
@@ -385,6 +398,21 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # フォルダツリー
     # ------------------------------------------------------------------
+    def _set_tree_model(self):
+        """フォルダツリーに新しいモデルを付ける (起動時と「更新」)。"""
+        old = getattr(self, "folder_tree_model", None)
+        self.folder_tree_model = QFileSystemModel(self)
+        self.folder_tree_model.setFilter(QDir.Filter.AllDirs | QDir.Filter.NoDotAndDotDot)
+        self.folder_tree.setModel(self.folder_tree_model)
+        for column in range(1, 4):
+            self.folder_tree.hideColumn(column)
+        # 列幅の固定はモデルを替えると戻ることがあるので、ここで毎回する (理由は _build_ui)
+        self.folder_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.folder_tree.header().resizeSection(0, 1200)
+        self.folder_tree.selectionModel().currentChanged.connect(self.on_tree_current_changed)
+        if old is not None:
+            old.deleteLater()
+
     def _sync_folder_tree(self, folder: Path):
         anchor = folder.anchor or str(folder)
         if anchor != self._tree_root:

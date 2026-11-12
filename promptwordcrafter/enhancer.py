@@ -34,7 +34,7 @@ from .translation import COPIED_MS, check_icon, copy_icon
 # 編集欄の右上に出す小窓
 # ----------------------------------------------------------------------
 class EnhancerPopup(QFrame):
-    """盛った結果を見てコピーするための小窓。翻訳の小窓 (右下) と重ならないよう右上に出す。"""
+    """盛ったプロンプトを見てコピーするための小窓。翻訳の小窓 (右下) と重ならないよう右上に出す。"""
 
     again_requested = Signal()
 
@@ -57,7 +57,7 @@ class EnhancerPopup(QFrame):
         layout.setSpacing(2)
 
         header = QHBoxLayout()
-        self.title_label = QLabel("盛った結果")
+        self.title_label = QLabel("盛ったプロンプト")
         self.title_label.setObjectName("enhancerTitle")
         header.addWidget(self.title_label, 1)
         self._copy_icon = copy_icon()
@@ -208,7 +208,7 @@ class EnhancerController(QObject):
         self.enhance_button.setEnabled(True)
         preset = self._running
         if error is None:
-            self.popup.show_message(self._title("盛った結果", preset), result or "")
+            self.popup.show_message(self._title("盛ったプロンプト", preset), result or "")
         else:
             self.popup.show_message(self._title("盛れませんでした", preset), error, copyable=False)
 
