@@ -518,7 +518,7 @@ class ResultsStrip(QWidget):
             if previewing and not self.preview.isVisible():
                 self._show_preview(self.list.currentItem())  # 大きく表示していたら、次のものを出す
         if error and len(gone) < len(paths):
-            self.status.emit(f"{error}: {len(paths) - len(gone)} 個 / ごみ箱へ移動 {len(gone)} 個")
+            self.status.emit(f"{error}  (残った {len(paths) - len(gone)} 個 / ごみ箱へ移動 {len(gone)} 個)")
         elif len(gone) == 1:
             self.status.emit(f"ごみ箱へ移動しました: {gone[0].name}")
         else:
