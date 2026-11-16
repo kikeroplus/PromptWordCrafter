@@ -2,7 +2,7 @@
 
 クリックで一覧の上に大きく表示 (もう一度クリック / Esc / 他の場所をクリックで閉じる。← → で切り替え)。
 ダブルクリック / Enter で関連付けアプリで開く。右クリックで「生成時の設定」
-「エクスプローラーで開く」「ごみ箱へ削除」。他のアプリへドラッグするとファイルとして渡す (コピーのみ)。
+「エクスプローラーで開く」「PrismLab に送る」「ごみ箱へ削除」。他のアプリへドラッグするとファイルとして渡す (コピーのみ)。
 """
 
 import os
@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import results
+from . import prismlab_link, results
 
 THUMB_SIZE = 140
 CELL_WIDTH = THUMB_SIZE + 16
@@ -502,12 +502,69 @@ class ResultsStrip(QWidget):
         explorer = menu.addAction("エクスプローラーで開く")
         explorer.triggered.connect(lambda: results.show_in_explorer(clicked))
         menu.addSeparator()
+        self._add_prismlab_menu(menu)
+        menu.addSeparator()
         if len(paths) > 1:
             delete = menu.addAction(f"選択中の {len(paths)} 個のファイルを削除 (ごみ箱へ)\tDel")
         else:
             delete = menu.addAction("ファイルを削除 (ごみ箱へ)\tDel")
         delete.triggered.connect(self.delete_selected)
         menu.exec(self.list.viewport().mapToGlobal(pos))
+
+    # PrismLab に送る (PrismLab の spec 5 章。J-Rate の「PrismLab に送る」と同じ項目) ----------------
+    def _selected_images(self) -> list[Path]:
+        """選んでいる画像 (動画は送らない)。帯は新しい順なので、作った順 (左から右の逆) に並べる。"""
+        items = sorted(self.list.selectedItems(), key=self.list.row, reverse=True)
+        return [Path(item.data(PATH_ROLE)) for item in items if not item.data(PATH_ROLE + 1)]
+
+    def _add_prismlab_menu(self, menu: QMenu) -> None:
+        images = self._selected_images()
+        unit = f" ({len(images)} 枚)" if len(images) > 1 else ""
+        sub = QMenu("PrismLab に送る" + unit, menu)  # 親を付けて作る (関数を抜けても消えないように)
+        menu.addMenu(sub)
+        sub.setToolTipsVisible(True)
+        sub.setEnabled(bool(images))
+        if not images:
+            sub.setTitle("PrismLab に送る (画像がありません)")
+            return
+        names = prismlab_link.recipe_names()
+        if names:
+            head = sub.addAction(f"量産の入口に{unit}:")
+            head.setEnabled(False)
+            for index, name in enumerate(names):
+                action = sub.addAction("    " + (name or "(名前なし)").replace("&", "&&"))
+                action.setToolTip("選んだ画像を、このレシピの入口 (選択) にします。始めるのは PrismLab で。")
+                action.triggered.connect(lambda _c=False, n=name, i=index: self._send(
+                    lambda: prismlab_link.send_to_recipe(images, n, i),
+                    f"{len(images)} 枚を PrismLab のレシピ「{n}」の入口に送りました。"))
+        else:
+            none = sub.addAction("(PrismLab のレシピがありません)")
+            none.setEnabled(False)
+        sub.addSeparator()
+        scenes = sub.addAction("物語: 新しいシーンにする" + unit)
+        scenes.setToolTip("PrismLab で開いている物語の最後に、1 枚ずつシーンチェンジのシーンとして足します。")
+        scenes.triggered.connect(lambda: self._send(lambda: prismlab_link.send_to_story(images, "scenes"),
+                                                    f"{len(images)} 枚を PrismLab の物語に新しいシーンとして送りました。"))
+        if len(images) != 1:
+            return
+        for slot, label, what in (("source", "物語: 選んでいるシーンの元画像に", "元画像"),
+                                  ("reference", "物語: 選んでいるシーンのリファレンス (顔) に", "リファレンス (顔)"),
+                                  ("last", "物語: 選んでいるシーンのラストフレームに", "ラストフレーム")):
+            action = sub.addAction(label)
+            action.triggered.connect(lambda _c=False, s=slot, w=what: self._send(
+                lambda: prismlab_link.send_to_story(images, s),
+                f"{images[0].name} を PrismLab の物語 (選んでいるシーンの{w}) に送りました。"))
+
+    def _send(self, send, done: str) -> None:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            problem = send()
+        finally:
+            QApplication.restoreOverrideCursor()
+        if problem:
+            QMessageBox.warning(self, "PrismLab に送る", problem)
+        else:
+            self.status.emit(done)
 
     def delete_selected(self):
         """選択中のファイルをごみ箱へ。1 つなら確認なし、複数かごみ箱に入らないときは確認する。"""

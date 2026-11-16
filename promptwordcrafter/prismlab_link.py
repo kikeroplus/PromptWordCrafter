@@ -1,6 +1,7 @@
 """PrismLab に送る (PrismLab の docs\\spec.md 5 章)。
 
 選んだテキストを、PrismLab の量産のレシピの入口か、物語の選んでいるシーンの元のプロンプトに入れてもらう。
+生成結果の帯の画像も、J-Rate と同じく レシピの入口 / 物語 (新しいシーン・元画像・リファレンス・ラストフレーム) に送れる。
 PrismLab の 2 重起動を止めるパイプ (PrismLab-(ユーザー名)) に JSON を書いて閉じる。
 動いていなければ、JSON を一時フォルダに書いて「PrismLab.exe --send (JSON のパス)」で起動する。
 """
@@ -89,6 +90,11 @@ def send(message: dict) -> str:
 
 def send_to_recipe(files: list[Path], name: str, index: int) -> str:
     return send({"target": "recipe", "recipe": name, "index": index, "files": [str(p) for p in files]})
+
+
+def send_to_story(files: list[Path], slot: str) -> str:
+    """物語に送る。slot: scenes (新しいシーン) / source (元画像) / reference (リファレンス) / last (ラストフレーム)。"""
+    return send({"target": "story", "slot": slot, "files": [str(p) for p in files]})
 
 
 def send_to_story_original(file: Path) -> str:
