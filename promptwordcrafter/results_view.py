@@ -36,6 +36,7 @@ CELL_HEIGHT = THUMB_SIZE + 34
 PATH_ROLE = Qt.ItemDataRole.UserRole
 PLACEHOLDER_COLOR = QColor("#e4e4e4")
 OLD_COLOR = QColor("#8a6d00")
+PRISMLAB_COLOR = QColor("#e0a000")  # PrismLab で作ったものの印 (PrismLab の強調色)
 
 
 class _ThumbnailLoader(QObject):
@@ -332,10 +333,11 @@ class ResultsStrip(QWidget):
             item.setData(PATH_ROLE, path)
             item.setData(PATH_ROLE + 1, result.is_video)
             item.setData(PATH_ROLE + 2, result.old)
+            item.setData(PATH_ROLE + 3, result.prismlab)
             item.setToolTip(self._tooltip(result))
             item.setSizeHint(QSize(CELL_WIDTH, CELL_HEIGHT))
             image = self._images.get(self._cache_key(result.path))
-            item.setIcon(self._icon(image, result.is_video, result.old))
+            item.setIcon(self._icon(image, result.is_video, result.old, result.prismlab))
             self.list.addItem(item)
             self._items[path] = item
             if path in selected:
@@ -367,6 +369,9 @@ class ResultsStrip(QWidget):
 
     def _tooltip(self, result: results.ResultFile) -> str:
         lines = [str(result.path)]
+        if result.prismlab and result.record is not None:
+            req = result.record.request
+            lines.append(f"PrismLab: {req.recipe or '(レシピ名なし)'}" + (f" ・ ステップ {req.step}" if req.step else ""))
         if result.record is not None and result.record.time:
             lines.append(f"生成した日時: {result.record.time}")
             lines.append(f"ワークフロー: {result.record.request.workflow_name}")
@@ -385,10 +390,11 @@ class ResultsStrip(QWidget):
             return
         item = self._items.get(path)
         if item is not None:
-            item.setIcon(self._icon(image, item.data(PATH_ROLE + 1), item.data(PATH_ROLE + 2)))
+            item.setIcon(self._icon(image, item.data(PATH_ROLE + 1), item.data(PATH_ROLE + 2),
+                                    bool(item.data(PATH_ROLE + 3))))
 
-    def _icon(self, image: Optional[QImage], is_video: bool, old: bool) -> QIcon:
-        """サムネールに印を重ねる (動画は左下に ▶、前の本文で作ったものは左上に「旧」)。"""
+    def _icon(self, image: Optional[QImage], is_video: bool, old: bool, prismlab: bool = False) -> QIcon:
+        """サムネールに印を重ねる (動画は左下に ▶、前の本文で作ったものは左上に「旧」、PrismLab で作ったものは右上に「PL」)。"""
         canvas = QPixmap(THUMB_SIZE, THUMB_SIZE)
         canvas.fill(Qt.GlobalColor.transparent)
         painter = QPainter(canvas)
@@ -415,6 +421,16 @@ class ResultsStrip(QWidget):
             font.setBold(True)
             painter.setFont(font)
             painter.drawText(QRect(4, 4, 26, 20), Qt.AlignmentFlag.AlignCenter, "旧")
+        if prismlab:
+            badge = QRect(THUMB_SIZE - 32, 4, 28, 20)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(PRISMLAB_COLOR)
+            painter.drawRoundedRect(badge, 4, 4)
+            painter.setPen(QColor("black"))
+            font = QFont(painter.font())
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, "PL")
         painter.end()
         return QIcon(canvas)
 

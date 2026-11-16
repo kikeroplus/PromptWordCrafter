@@ -4,6 +4,8 @@
 「(テキストの名前)_t2i*.png」「(テキストの名前)_video*.mp4」で拾う (「生成結果」フォルダと、
 前の置き場所だったテキストと同じフォルダの両方)。
 記録に残っている本文と今の本文を比べ、前の本文で作ったものには印を付ける。
+PrismLab の量産でこのテキストから作ったもの (PrismLab の記録の origin がこのテキスト) も出す
+(出力はレシピの出力フォルダにあるので、名前を変えても動かさない。PrismLab の spec 5 章)。
 """
 
 import ctypes
@@ -35,6 +37,10 @@ class ResultFile:
     old: bool  # 今の本文とは違う (前の) 本文で生成した
     time: float  # 並べ替え用 (更新日時)
     record: Optional[comfy.GenRecord] = None
+    prismlab: bool = False  # PrismLab の量産で作ったもの
+
+
+PRISMLAB_APP = "PrismLab"
 
 
 def _key(path) -> str:
@@ -94,6 +100,21 @@ def find_results(source: Path, current_text: str, records: Optional[list] = None
         old = record.request.prompt is not None and not _same_text(record.request.prompt, current_text)
         found[key] = ResultFile(path, _is_video(path), old, _mtime(path), record)
 
+    # PrismLab の量産: 入口がこのテキストのもの (ラインの途中のステップの出力も)
+    for record in reversed(comfy.read_history(PRISMLAB_APP)):
+        output = record.output
+        if not output or not record.request.origin or _key(record.request.origin) != source_key:
+            continue
+        key = _key(output)
+        if key in found:
+            continue
+        path = Path(output)
+        if not path.is_file():
+            continue
+        origin_text = record.request.origin_text
+        old = origin_text is not None and not _same_text(origin_text, current_text)
+        found[key] = ResultFile(path, _is_video(path), old, _mtime(path), record, prismlab=True)
+
     pattern = _name_pattern(source.stem)
     for folder in (results_dir(source), source.parent):  # 前はテキストと同じフォルダに置いていた
         try:
@@ -136,6 +157,8 @@ def rename_results(plan: list[tuple[Path, Path]]) -> tuple[int, list[str]]:
         except OSError:
             text = ""
         for result in find_results(old, text, records):
+            if result.prismlab:
+                continue  # PrismLab の出力は名前を変えない (記録の origin だけ付け替える)
             name = result.path.name
             if not name.lower().startswith(old.stem.lower()):
                 continue  # 名前の頭がテキストの名前でないもの (別の名前で保存し直したなど) は触らない
@@ -199,6 +222,7 @@ def rename_results(plan: list[tuple[Path, Path]]) -> tuple[int, list[str]]:
     comfy.rename_in_history({**text_renames, **output_renames})
     for app_name in READER_APPS:
         comfy.rename_in_history(output_renames, app_name)  # 結果を元画像にした記録
+    comfy.rename_in_history(text_renames, PRISMLAB_APP)  # PrismLab の記録の origin (入口のテキスト)
     return len(output_renames), errors
 
 
@@ -219,7 +243,7 @@ def old_place_results(folder: Path) -> list[Path]:
         except OSError:
             text = ""
         for result in find_results(source, text, records):
-            if _key(result.path.parent) == _key(folder):
+            if not result.prismlab and _key(result.path.parent) == _key(folder):
                 found[_key(result.path)] = result.path
     return sorted(found.values(), key=lambda p: p.name.lower())
 

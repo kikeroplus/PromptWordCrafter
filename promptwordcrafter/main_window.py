@@ -6,10 +6,11 @@ PromptManager プロジェクトの text_replace_tool.py (Text Preview Search Re
 
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QDir, QSize, Qt, QTimer
+from PySide6.QtCore import QDir, QEvent, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QKeySequence, QShortcut, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
 from gencommon.generation import GenerationController
 
 from . import bulk_ops
+from . import prismlab_link
 from . import results
 from . import settings as settings_module
 from . import text_io
@@ -1094,7 +1096,74 @@ class MainWindow(QMainWindow):
         jobs.triggered.connect(self.generation.show_jobs)
         settings = menu.addAction("生成の設定...")
         settings.triggered.connect(self.generation.show_settings)
+        menu.addSeparator()
+        self._add_prismlab_menu(menu, selected)
         menu.exec(self.file_list.viewport().mapToGlobal(pos))
+
+    # ------------------------------------------------------------------
+    # PrismLab に送る (PrismLab の spec 5 章)
+    # ------------------------------------------------------------------
+    def _add_prismlab_menu(self, menu: QMenu, selected: list[Path]) -> None:
+        sub = QMenu("PrismLab に送る", menu)  # 親を付けて作る (addMenu("名前") のものは関数を抜けると消える)
+        menu.addMenu(sub)
+        sub.setToolTipsVisible(True)
+        sub.setEnabled(bool(selected))
+        names = prismlab_link.recipe_names()
+        unit = f" ({len(selected)} 件)" if len(selected) > 1 else ""
+        if names:
+            head = sub.addAction(f"量産の入口に{unit}:")
+            head.setEnabled(False)
+            for index, name in enumerate(names):
+                action = sub.addAction("    " + (name or "(名前なし)"))
+                action.setToolTip("選んだテキストを、このレシピの入口 (選択) にします。始めるのは PrismLab で。")
+                action.triggered.connect(lambda _c=False, n=name, i=index: self.send_to_prismlab_recipe(n, i))
+        else:
+            none = sub.addAction("(PrismLab のレシピがありません)")
+            none.setEnabled(False)
+        sub.addSeparator()
+        story = sub.addAction("物語: 選んでいるシーンの元のプロンプトに")
+        story.setToolTip("PrismLab で開いている物語の、選んでいるシーンの元のプロンプトをこの本文にします (1 件のとき)。")
+        story.setEnabled(len(selected) == 1)
+        story.triggered.connect(self.send_to_prismlab_story)
+
+    def _save_before_send(self, files: list[Path]) -> bool:
+        """送るものの中に編集中のファイルがあれば保存する (PrismLab はファイルを読むので)。"""
+        if self.current_path is not None and self.text_edit.document().isModified() \
+                and any(results.same_path(f, self.current_path) for f in files):
+            return self.save_current_file(refocus=False)
+        return True
+
+    def send_to_prismlab_recipe(self, name: str, index: int) -> None:
+        files = self.selected_files()
+        if not files or not self._save_before_send(files):
+            return
+        problem = prismlab_link.send_to_recipe(files, name, index)
+        if problem:
+            QMessageBox.warning(self, "PrismLab に送る", problem)
+        else:
+            self.statusBar().showMessage(f"{len(files)} 件を PrismLab のレシピ「{name}」の入口に送りました。")
+
+    def send_to_prismlab_story(self) -> None:
+        files = self.selected_files()
+        if len(files) != 1 or not self._save_before_send(files):
+            return
+        problem = prismlab_link.send_to_story_original(files[0])
+        if problem:
+            QMessageBox.warning(self, "PrismLab に送る", problem)
+        else:
+            self.statusBar().showMessage(f"{files[0].name} を PrismLab の物語 (選んでいるシーンの元のプロンプト) に送りました。")
+
+    def changeEvent(self, event):
+        # PrismLab などから戻ってきたら、生成結果の帯を読み直す (PrismLab の量産の結果が増えているかもしれない)
+        if event.type() == QEvent.Type.ActivationChange:
+            if self.isActiveWindow():
+                away = getattr(self, "_left_at", None)
+                if away is not None and time.monotonic() - away >= 1.0:
+                    self.results_strip.refresh(self.text_edit.toPlainText())
+                self._left_at = None
+            elif QApplication.activeModalWidget() is None:
+                self._left_at = time.monotonic()
+        super().changeEvent(event)
 
     def on_generation_done(self, job):
         """表示中のテキストから生成したものなら、生成結果の一覧に加える。"""
