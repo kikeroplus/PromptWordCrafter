@@ -93,7 +93,7 @@ def send_to_recipe(files: list[Path], name: str, index: int) -> str:
 
 
 def send_to_story(files: list[Path], slot: str) -> str:
-    """物語に送る。slot: scenes (新しいシーン) / source (元画像) / reference (リファレンス) / last (ラストフレーム)。"""
+    """物語に送る。slot: scenes (新しいシーン) / source (元画像) / reference (リファレンス) / last (ラストフレーム) / batch (物語のバッチの最初の画像)。"""
     return send({"target": "story", "slot": slot, "files": [str(p) for p in files]})
 
 

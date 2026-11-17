@@ -545,6 +545,12 @@ class ResultsStrip(QWidget):
         scenes.setToolTip("PrismLab で開いている物語の最後に、1 枚ずつシーンチェンジのシーンとして足します。")
         scenes.triggered.connect(lambda: self._send(lambda: prismlab_link.send_to_story(images, "scenes"),
                                                     f"{len(images)} 枚を PrismLab の物語に新しいシーンとして送りました。"))
+        batch = sub.addAction("物語: バッチに足す..." + unit)
+        batch.setToolTip("PrismLab の「物語のバッチ」の設定の窓を出し、1 枚ごとに 1 件のバッチの最初の画像にします。"
+                         "待ち行列に足すと、前のものが終わってから順に作ります。")
+        batch.triggered.connect(lambda: self._send(lambda: prismlab_link.send_to_story(images, "batch"),
+                                                   f"{len(images)} 枚を PrismLab の物語のバッチに送りました"
+                                                   " (PrismLab の窓で待ち行列に足します)。"))
         if len(images) != 1:
             return
         for slot, label, what in (("source", "物語: 選んでいるシーンの元画像に", "元画像"),
