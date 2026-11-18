@@ -1020,11 +1020,20 @@ class MainWindow(QMainWindow):
 
         menu = QMenu(self)
         count = len(text_io.list_text_files(folder))
-        generate = menu.addAction(f"このフォルダのテキストをまとめて生成する ({count} 件)...")
+        # PWC で生成 (PrismLab を使わない、このアプリの中の生成)
+        pwc = QMenu("PWC で生成", menu)  # 親を付けて作る (関数を抜けても消えないように)
+        menu.addMenu(pwc)
+        generate = pwc.addAction(f"このフォルダのテキストをまとめて生成する ({count} 件)...")
         generate.setEnabled(count > 0)
         generate.triggered.connect(lambda: self.generate_folder(folder, recursive=False))
-        generate_all = menu.addAction("サブフォルダも含めてまとめて生成する...")
+        generate_all = pwc.addAction("サブフォルダも含めてまとめて生成する...")
         generate_all.triggered.connect(lambda: self.generate_folder(folder, recursive=True))
+        pwc.addSeparator()
+        jobs = pwc.addAction("生成ジョブの一覧...\tCtrl+J")
+        jobs.triggered.connect(self.generation.show_jobs)
+        settings = pwc.addAction("生成の設定...")
+        settings.triggered.connect(self.generation.show_settings)
+        self._add_prismlab_folder_menu(menu, folder, count)
         menu.addSeparator()
         # 数えるのは選んだときにする (テキストごとに結果を探すので、右クリックのたびには重い)
         move = menu.addAction(f"このフォルダの生成結果を「{text_io.RESULTS_DIR}」フォルダへ移す...")
@@ -1081,22 +1090,25 @@ class MainWindow(QMainWindow):
         selected = self.selected_files()
 
         menu = QMenu(self)
+        # PWC で生成 (PrismLab を使わない、このアプリの中の生成)
+        pwc = QMenu("PWC で生成", menu)  # 親を付けて作る (関数を抜けても消えないように)
+        menu.addMenu(pwc)
         if len(selected) > 1:
-            generate = menu.addAction(f"選択中のファイルを生成する ({len(selected)} 件)...")
+            generate = pwc.addAction(f"選択中のファイルを生成する ({len(selected)} 件)...")
         else:
-            generate = menu.addAction("生成する (ComfyUI)...")
+            generate = pwc.addAction("生成する (ComfyUI)...")
         generate.setEnabled(bool(selected))
         generate.triggered.connect(self.generate_selected)
-        generate_all = menu.addAction(f"一覧のファイルをまとめて生成する ({len(self.files)} 件)...")
+        generate_all = pwc.addAction(f"一覧のファイルをまとめて生成する ({len(self.files)} 件)...")
         generate_all.triggered.connect(self.generate_all)
-        info = menu.addAction("生成時の設定...")
+        info = pwc.addAction("生成時の設定...")
         info.setEnabled(clicked is not None and self.generation.has_history(clicked))
         info.triggered.connect(lambda: self.generation.show_gen_info(clicked))
-        jobs = menu.addAction("生成ジョブの一覧...	Ctrl+J")
+        pwc.addSeparator()
+        jobs = pwc.addAction("生成ジョブの一覧...\tCtrl+J")
         jobs.triggered.connect(self.generation.show_jobs)
-        settings = menu.addAction("生成の設定...")
+        settings = pwc.addAction("生成の設定...")
         settings.triggered.connect(self.generation.show_settings)
-        menu.addSeparator()
         self._add_prismlab_menu(menu, selected)
         menu.exec(self.file_list.viewport().mapToGlobal(pos))
 
@@ -1125,6 +1137,49 @@ class MainWindow(QMainWindow):
         story.setToolTip("PrismLab で開いている物語の、選んでいるシーンの元のプロンプトをこの本文にします (1 件のとき)。")
         story.setEnabled(len(selected) == 1)
         story.triggered.connect(self.send_to_prismlab_story)
+
+    def _add_prismlab_folder_menu(self, menu: QMenu, folder: Path, count: int) -> None:
+        """フォルダツリーの「PrismLab に送る」。直下だけ / サブフォルダ込みを、それぞれレシピの入口に送れる。"""
+        sub = QMenu("PrismLab に送る", menu)
+        menu.addMenu(sub)
+        sub.setToolTipsVisible(True)
+        names = prismlab_link.recipe_names()
+        if not names:
+            none = sub.addAction("(PrismLab のレシピがありません)")
+            none.setEnabled(False)
+            return
+        scopes = [(False, f"このフォルダのテキスト ({count} 件) を量産の入口に:"),
+                  (True, "サブフォルダも含めて量産の入口に:")]
+        for number, (recursive, title) in enumerate(scopes):
+            if number:
+                sub.addSeparator()
+            head = sub.addAction(title)
+            head.setEnabled(False)
+            for index, name in enumerate(names):
+                action = sub.addAction("    " + (name or "(名前なし)"))
+                action.setToolTip("フォルダのテキストを、このレシピの入口 (選択) にします。始めるのは PrismLab で。")
+                action.setEnabled(recursive or count > 0)
+                action.triggered.connect(
+                    lambda _c=False, n=name, i=index, r=recursive: self.send_folder_to_prismlab_recipe(folder, r, n, i))
+
+    def send_folder_to_prismlab_recipe(self, folder: Path, recursive: bool, name: str, index: int) -> None:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)  # サブフォルダが多いと数えるのに時間がかかる
+        try:
+            files = text_io.list_text_files(folder, recursive)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not files:
+            where = "このフォルダとサブフォルダ" if recursive else "このフォルダ"
+            self.statusBar().showMessage(f"{where}にテキストファイルがありません: {folder}")
+            return
+        if not self._save_before_send(files):
+            return
+        problem = prismlab_link.send_to_recipe(files, name, index)
+        if problem:
+            QMessageBox.warning(self, "PrismLab に送る", problem)
+        else:
+            what = f"フォルダ「{folder.name or folder}」" + ("とサブフォルダ" if recursive else "")
+            self.statusBar().showMessage(f"{what}のテキスト {len(files)} 件を PrismLab のレシピ「{name}」の入口に送りました。")
 
     def _save_before_send(self, files: list[Path]) -> bool:
         """送るものの中に編集中のファイルがあれば保存する (PrismLab はファイルを読むので)。"""
