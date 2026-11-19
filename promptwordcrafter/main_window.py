@@ -355,6 +355,32 @@ class MainWindow(QMainWindow):
         self._tree_root = None
         self.load_folder(confirm=False, keep=keep)
 
+    def open_from_link(self, folder: Path, select: list[Path], sender: str = "") -> None:
+        """ほかのアプリ (MuseFactory) から「このフォルダを開いて、このファイルを選ぶ」と頼まれたとき。
+
+        開いているフォルダと同じでも読み直す (ファイルが増えているので)。未保存の編集があればいつもどおり確かめる。
+        """
+        who = sender or "ほかのアプリ"
+        if not folder.is_dir():
+            self.statusBar().showMessage(f"{who} から: フォルダが見つかりません: {folder}")
+            return
+        if not self.confirm_save_changes():
+            return
+        # 外で足したフォルダ (.muse など) を拾いそこねないよう、ツリーを作り直す (「更新」と同じ)
+        self._set_tree_model()
+        self._tree_root = None
+        self.folder_edit.setText(str(folder))
+        self.load_folder(confirm=False, keep=select[0] if select else None)
+        found = 0
+        for row, path in enumerate(self.files):
+            if any(results.same_path(path, wanted) for wanted in select):
+                self.file_list.item(row).setSelected(True)
+                found += 1
+        message = f"{who} から開きました"
+        if select:
+            message += f" ({found} / {len(select)} 件を選択)"
+        self.statusBar().showMessage(message)
+
     def load_folder(self, confirm: bool = True, keep: Optional[Path] = None):
         if confirm and not self.confirm_save_changes():
             return
