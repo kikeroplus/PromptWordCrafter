@@ -164,22 +164,8 @@ class MainWindow(QMainWindow):
         bulk_bar.addWidget(self.reformat_button)
         bulk_bar.addStretch(1)
 
-        # 生成 (ComfyUI) グループ: 生成する | 生成ジョブ | 生成の設定
-        generate_group = QGroupBox("生成 (ComfyUI)")
-        generate_bar = QHBoxLayout(generate_group)
-        self.generate_button = QPushButton("生成する")
-        self.generate_button.setToolTip("選択中のテキストファイルの本文をプロンプトにして、ComfyUI で生成します")
-        generate_bar.addWidget(self.generate_button)
-        self.jobs_button = QPushButton("生成ジョブ")
-        self.jobs_button.setToolTip("生成ジョブの一覧 (Ctrl+J)")
-        generate_bar.addWidget(self.jobs_button)
-        self.generate_settings_button = QPushButton("生成の設定")
-        generate_bar.addWidget(self.generate_settings_button)
-        self.diagram_settings_button = QPushButton("図で設定")
-        self.diagram_settings_button.setToolTip(
-            "設定・処理・送る前の確認を図のように並べた画面で、次に生成するときの設定を決めます (生成はしません)"
-        )
-        generate_bar.addWidget(self.diagram_settings_button)
+        # 生成は下の「生成 (PrismLab のレシピ)」の段だけ (2026-11-22 利用者の決定: 生成の設定は PrismLab に寄せ、
+        # 「生成する」「生成ジョブ」「生成の設定」「図で設定」は外した)
 
         # 翻訳 (AI) グループ: 翻訳する | 翻訳の設定 (部品は編集欄を作った後に入れる)
         translate_group = QGroupBox("翻訳 (AI)")
@@ -191,7 +177,6 @@ class MainWindow(QMainWindow):
 
         tool_row = QHBoxLayout()
         tool_row.addWidget(bulk_group, 1)
-        tool_row.addWidget(generate_group)
         tool_row.addWidget(translate_group)
         tool_row.addWidget(enhance_group)
         root_layout.addLayout(tool_row)
@@ -299,16 +284,10 @@ class MainWindow(QMainWindow):
         self.folder_tree.customContextMenuRequested.connect(self.show_folder_menu)
 
         self.file_list.customContextMenuRequested.connect(self.show_file_menu)
-        self.generate_button.clicked.connect(self.generate_selected)
-        self.jobs_button.clicked.connect(self.generation.show_jobs)
-        self.generate_settings_button.clicked.connect(self.generation.show_settings)
-        self.diagram_settings_button.clicked.connect(self.diagram_settings)
-        self.generation.jobs_changed.connect(self.update_jobs_button)
+        # 前の形で頼んで終わっていなかったジョブ (起動したときに続きから始める) の結果だけは受け取る
         self.generation.job_done.connect(self.on_generation_done)
         self.results_strip.status.connect(self.statusBar().showMessage)
         self.results_strip.info_requested.connect(self.generation.show_record)
-        jobs_shortcut = QShortcut(QKeySequence("Ctrl+J"), self)
-        jobs_shortcut.activated.connect(self.generation.show_jobs)
 
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         save_shortcut.activated.connect(lambda: self.save_current_file())
@@ -406,7 +385,6 @@ class MainWindow(QMainWindow):
 
         if not folder.is_dir():
             self.statusBar().showMessage("指定されたフォルダが見つかりません。")
-            self.generate_button.setEnabled(False)
             return
 
         self._sync_folder_tree(folder)
@@ -421,7 +399,6 @@ class MainWindow(QMainWindow):
                 self.file_list.addItem(item)
 
         self.statusBar().showMessage(f"{len(self.files)} 件のテキストファイルを表示しています。")
-        self.generate_button.setEnabled(bool(self.files))
         if self.files:
             row = next((i for i, p in enumerate(self.files) if keep is not None and results.same_path(p, keep)), 0)
             self.file_list.setCurrentRow(row)
@@ -1009,15 +986,6 @@ class MainWindow(QMainWindow):
         rows = sorted(self.file_list.row(item) for item in self.file_list.selectedItems())
         return [self.files[row] for row in rows if 0 <= row < len(self.files)]
 
-    def generate_selected(self):
-        sources = self.selected_files()
-        if not sources and self.current_path is not None:
-            sources = [self.current_path]
-        if not sources:
-            self.statusBar().showMessage("生成するテキストファイルを選択してください。")
-            return
-        self.generation.generate(sources, what="選択中のファイル")
-
     def _recipe_sources(self) -> list[Path]:
         """PrismLab のレシピで生成するもの: 選択中のテキスト (なければ表示中のもの)。"""
         sources = self.selected_files()
@@ -1030,30 +998,6 @@ class MainWindow(QMainWindow):
         if self.current_path is not None:
             self.results_strip.refresh(self.text_edit.toPlainText())
 
-    def diagram_settings(self):
-        """「図で設定」: 選択中 (なければ表示中) のテキストの本文で、送る前の確認を見せる。"""
-        sources = self.selected_files()
-        if not sources and self.current_path is not None:
-            sources = [self.current_path]
-        self.generation.show_diagram_settings(sources)
-
-    def generate_all(self):
-        self.generation.generate(list(self.files), what="一覧のファイル")
-
-    def generate_folder(self, folder: Path, recursive: bool):
-        """フォルダツリーで右クリックしたフォルダのテキストを、まとめて生成する。"""
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)  # サブフォルダが多いと数えるのに時間がかかる
-        try:
-            sources = text_io.list_text_files(folder, recursive)
-        finally:
-            QApplication.restoreOverrideCursor()
-        if not sources:
-            where = "このフォルダとサブフォルダ" if recursive else "このフォルダ"
-            self.statusBar().showMessage(f"{where}にテキストファイルがありません: {folder}")
-            return
-        what = f"フォルダ「{folder.name or folder}」" + ("とサブフォルダ" if recursive else "")
-        self.generation.generate(sources, what=what)
-
     def show_folder_menu(self, pos):
         """フォルダツリーの右クリックメニュー。右クリックしただけではフォルダを開かない。"""
         index = self.folder_tree.indexAt(pos)
@@ -1064,20 +1008,12 @@ class MainWindow(QMainWindow):
             return
 
         menu = QMenu(self)
-        count = len(text_io.list_text_files(folder))
-        # PWC で生成 (PrismLab を使わない、このアプリの中の生成)
-        pwc = QMenu("PWC で生成", menu)  # 親を付けて作る (関数を抜けても消えないように)
-        menu.addMenu(pwc)
-        generate = pwc.addAction(f"このフォルダのテキストをまとめて生成する ({count} 件)...")
-        generate.setEnabled(count > 0)
-        generate.triggered.connect(lambda: self.generate_folder(folder, recursive=False))
-        generate_all = pwc.addAction("サブフォルダも含めてまとめて生成する...")
-        generate_all.triggered.connect(lambda: self.generate_folder(folder, recursive=True))
-        pwc.addSeparator()
-        jobs = pwc.addAction("生成ジョブの一覧...\tCtrl+J")
-        jobs.triggered.connect(self.generation.show_jobs)
-        settings = pwc.addAction("生成の設定...")
-        settings.triggered.connect(self.generation.show_settings)
+        texts = text_io.list_text_files(folder)
+        count = len(texts)
+        # PrismLab のレシピで生成 (このフォルダのテキスト / サブフォルダも。サブフォルダは選んだときに数える)
+        self.recipe_panel.recipe_menu(menu, texts, f"このフォルダのテキストをレシピで生成 ({count} 件)")
+        self.recipe_panel.recipe_menu(menu, lambda: text_io.list_text_files(folder, True),
+                                      "サブフォルダも含めてレシピで生成")
         self._add_prismlab_folder_menu(menu, folder, count)
         menu.addSeparator()
         # 数えるのは選んだときにする (テキストごとに結果を探すので、右クリックのたびには重い)
@@ -1121,11 +1057,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "生成結果を移す", message + "\n\n移せなかったもの:\n" + "\n".join(errors[:20]))
         self.statusBar().showMessage(message)
 
-    def update_jobs_button(self):
-        active = self.generation.active_count
-        paused = "・一時停止中" if self.generation.paused else ""
-        self.jobs_button.setText(f"生成ジョブ ({active}{paused})" if active else "生成ジョブ")
-
     def show_file_menu(self, pos):
         """ファイル一覧の右クリックメニュー (生成 (ComfyUI) の操作)。ファイルがないときは出さない。"""
         if not self.files:
@@ -1135,26 +1066,14 @@ class MainWindow(QMainWindow):
         selected = self.selected_files()
 
         menu = QMenu(self)
-        # PWC で生成 (PrismLab を使わない、このアプリの中の生成)
-        pwc = QMenu("PWC で生成", menu)  # 親を付けて作る (関数を抜けても消えないように)
-        menu.addMenu(pwc)
-        if len(selected) > 1:
-            generate = pwc.addAction(f"選択中のファイルを生成する ({len(selected)} 件)...")
-        else:
-            generate = pwc.addAction("生成する (ComfyUI)...")
-        generate.setEnabled(bool(selected))
-        generate.triggered.connect(self.generate_selected)
-        generate_all = pwc.addAction(f"一覧のファイルをまとめて生成する ({len(self.files)} 件)...")
-        generate_all.triggered.connect(self.generate_all)
-        info = pwc.addAction("生成時の設定...")
+        self.recipe_panel.recipe_menu(menu, selected or ([clicked] if clicked is not None else []),
+                                      f"選択中のファイルをレシピで生成 ({len(selected)} 件)" if len(selected) > 1
+                                      else "PrismLab のレシピで生成")
+        self.recipe_panel.recipe_menu(menu, list(self.files), f"一覧のファイルをレシピで生成 ({len(self.files)} 件)")
+        info = menu.addAction("生成時の設定...")
         info.setEnabled(clicked is not None and self.generation.has_history(clicked))
         info.triggered.connect(lambda: self.generation.show_gen_info(clicked))
-        pwc.addSeparator()
-        jobs = pwc.addAction("生成ジョブの一覧...\tCtrl+J")
-        jobs.triggered.connect(self.generation.show_jobs)
-        settings = pwc.addAction("生成の設定...")
-        settings.triggered.connect(self.generation.show_settings)
-        self.recipe_panel.recipe_menu(menu, selected or ([clicked] if clicked is not None else []))
+        menu.addSeparator()
         self._add_prismlab_menu(menu, selected)
         menu.exec(self.file_list.viewport().mapToGlobal(pos))
 
