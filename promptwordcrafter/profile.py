@@ -45,6 +45,8 @@ PROFILE = app.Profile(
     ),
     open_on_done=True,
     skip_empty=True,
+    regenerate=False,  # 「この設定で生成する...」は出さない (生成の設定は PrismLab のレシピ)
+    machines=True,  # 接続先の「振り分け」: 台の設定の台 (最大 3 台) の空いている台に回す (GenCommon machines.py)
 )
 
 

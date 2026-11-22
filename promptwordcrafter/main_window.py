@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from gencommon.generation import GenerationController
+from gencommon.recipe_panel import RecipePanel
 
 from . import bulk_ops
 from . import prismlab_link
@@ -194,6 +195,12 @@ class MainWindow(QMainWindow):
         tool_row.addWidget(translate_group)
         tool_row.addWidget(enhance_group)
         root_layout.addLayout(tool_row)
+
+        # PrismLab のレシピ (2026-11-22): 台を選び、ファイルを選んでレシピを押すと PrismLab が裏で生成する
+        self.recipe_panel = RecipePanel(self._recipe_sources, self)
+        self.recipe_panel.status.connect(lambda text: self.statusBar().showMessage(text, 15000))
+        self.recipe_panel.outputs_added.connect(self._refresh_results)
+        root_layout.addWidget(self.recipe_panel)
 
         # フォルダツリー + ファイル一覧 + プレビュー編集
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1011,6 +1018,18 @@ class MainWindow(QMainWindow):
             return
         self.generation.generate(sources, what="選択中のファイル")
 
+    def _recipe_sources(self) -> list[Path]:
+        """PrismLab のレシピで生成するもの: 選択中のテキスト (なければ表示中のもの)。"""
+        sources = self.selected_files()
+        if not sources and self.current_path is not None:
+            sources = [self.current_path]
+        return sources
+
+    def _refresh_results(self):
+        """PrismLab で新しく出来たものがあれば、表示中のテキストの生成結果の帯を読み直す。"""
+        if self.current_path is not None:
+            self.results_strip.refresh(self.text_edit.toPlainText())
+
     def diagram_settings(self):
         """「図で設定」: 選択中 (なければ表示中) のテキストの本文で、送る前の確認を見せる。"""
         sources = self.selected_files()
@@ -1135,6 +1154,7 @@ class MainWindow(QMainWindow):
         jobs.triggered.connect(self.generation.show_jobs)
         settings = pwc.addAction("生成の設定...")
         settings.triggered.connect(self.generation.show_settings)
+        self.recipe_panel.recipe_menu(menu, selected or ([clicked] if clicked is not None else []))
         self._add_prismlab_menu(menu, selected)
         menu.exec(self.file_list.viewport().mapToGlobal(pos))
 
