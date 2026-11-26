@@ -1,7 +1,9 @@
 """小さなカスタムウィジェット群。"""
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLineEdit, QTreeView
+from PySide6.QtWidgets import QLineEdit, QSpinBox, QTreeView
+
+from . import tokens
 
 
 class NewlineAwareLineEdit(QLineEdit):
@@ -42,3 +44,19 @@ class FolderTreeView(QTreeView):
         preserved = h_scroll.value()
         super().keyPressEvent(event)
         h_scroll.setValue(preserved)
+
+
+def token_limit_spin(value: int, what: str) -> QSpinBox:
+    """AI の返事の長さの上限 (おおよそのトークン数。0 = 上限なし)。"""
+    spin = QSpinBox()
+    spin.setRange(0, tokens.LIMIT_MAX)
+    spin.setSingleStep(tokens.LIMIT_STEP)
+    spin.setSpecialValueText("上限なし")
+    spin.setPrefix("上限 ")
+    spin.setSuffix(" トークン")
+    spin.setValue(max(0, min(int(value or 0), tokens.LIMIT_MAX)))
+    spin.setToolTip(
+        f"{what}の結果の長さの上限 (おおよそのトークン数)。0 で上限なし。\n"
+        "「約 N トークン以内で」と AI に伝え、守らないときは N の 1.5 倍ほどで打ち切ります。"
+    )
+    return spin

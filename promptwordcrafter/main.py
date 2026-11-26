@@ -12,9 +12,11 @@ from . import profile
 from .icon import make_icon
 from .main_window import MainWindow
 
-# 2 つ目を起動したら、先に動いているほうを前に出して自分は終わる。
-# 2 つ目を閉じたときに 1 つ目のジョブリストが失われないようにするため。
+# 多重起動できる (2026-11-26 利用者の希望。前は 2 つ目を起動すると 1 つ目を前に出して終わっていた)。
+# パイプはどれか 1 つの窓 (受け手) だけが持ち、ほかのアプリからの頼みはその窓で受ける。
+# 受け手が閉じたら、残っている窓が引き継ぐ (TAKEOVER_MS ごとに確かめる)。
 _SERVER_NAME = f"PromptWordCrafter-{getpass.getuser()}"
+TAKEOVER_MS = 3000
 
 # ほかのアプリ (MuseFactory) から「フォルダを開いて、ファイルを選ぶ」と頼まれる。
 # 動いているときはパイプに 1 行の JSON {"cmd": "open", "from": ..., "folder": ..., "select": [...]} が来る。
@@ -82,6 +84,35 @@ def _bring_to_front(window: MainWindow) -> None:
     window.activateWindow()
 
 
+def _is_running() -> bool:
+    """ほかの窓がパイプを持っているか (つながるか)。"""
+    socket = QLocalSocket()
+    socket.connectToServer(_SERVER_NAME)
+    if not socket.waitForConnected(300):
+        return False
+    socket.write(b"ping\n")  # 受け手は何もしない
+    socket.flush()
+    socket.waitForBytesWritten(300)
+    socket.disconnectFromServer()
+    return True
+
+
+def _keep_server(window: MainWindow) -> None:
+    """パイプの受け手になる。ほかの窓が持っていれば、その窓が閉じるまで待って引き継ぐ。"""
+    if not _is_running():
+        window._link_server = _start_server(window)
+        return
+    timer = QTimer(window)
+
+    def check():
+        if not _is_running():
+            timer.stop()
+            window._link_server = _start_server(window)
+
+    timer.timeout.connect(check)
+    timer.start(TAKEOVER_MS)
+
+
 def _start_server(window: MainWindow) -> QLocalServer:
     server = QLocalServer(window)
     if not server.listen(_SERVER_NAME):
@@ -102,6 +133,8 @@ def _start_server(window: MainWindow) -> QLocalServer:
                 state["done"] = True
                 # 送り手は切られるのを待っている (読み終えた合図)
                 conn.disconnectFromServer()
+                if bytes(buffer).strip() in (b"", b"ping"):
+                    return  # ほかの窓が受け手がいるか確かめただけ (前に出さない)
                 _bring_to_front(window)
                 _handle_message(window, bytes(buffer))
 
@@ -122,12 +155,13 @@ def _start_server(window: MainWindow) -> QLocalServer:
 def main():
     app = QApplication(sys.argv)
     open_request = _read_open_arg()
-    if _notify_running_instance(open_request or b"show"):
+    # ほかのアプリからの頼み (--open) は、動いている窓があればそこで開く。ふつうの起動は新しい窓を開く
+    if open_request and _notify_running_instance(open_request):
         sys.exit(0)
     app.setWindowIcon(make_icon())
     merged = profile.setup()  # 設定の置き場所を決め、初めてなら共有の設定に移す
-    window = MainWindow()
-    _start_server(window)
+    window = MainWindow(resume_jobs=not _is_running())
+    _keep_server(window)
     window.show()
     if merged:
         window.statusBar().showMessage("共有の設定: " + "。".join(merged))

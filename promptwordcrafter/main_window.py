@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QDir, QEvent, QSize, Qt, QTimer
+from PySide6.QtCore import QDir, QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QKeySequence, QShortcut, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
@@ -33,21 +33,26 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gencommon import llm
+from gencommon import translation as translation_core
 from gencommon.generation import GenerationController
 from gencommon.recipe_panel import RecipePanel
 
 from . import bulk_ops
+from . import file_ops
+from . import organizer
 from . import prismlab_link
 from . import results
 from . import settings as settings_module
 from . import text_io
-from .dialogs import AddTextDialog, NewFileDialog, RemoveTextDialog, RenameDialog
+from . import tokens
+from .dialogs import AddTextDialog, NewFileDialog, RemoveTextDialog, RenameDialog, TransferDialog
 from .file_list import FileListWidget
 from .enhancer import EnhancerController
 from .highlighter import TagHighlighter
 from .results_view import ResultsStrip
 from .translation import TranslationController
-from .widgets import FolderTreeView, NewlineAwareLineEdit
+from .widgets import FolderTreeView, NewlineAwareLineEdit, token_limit_spin
 
 FILE_MATCH_BACKGROUND = "#edf5ef"
 MATCH_BACKGROUND = "#fff2a8"
@@ -62,7 +67,12 @@ SCAN_DEBOUNCE_MS = 250
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    _organized = Signal(object, object)  # 項目整理の (結果, エラー文)
+    _transferred = Signal(object, object)  # コピー・移動の (結果, エラー文)
+    _translated_file = Signal(object, object)  # 翻訳して書き出すの (訳, エラー文)
+
+    def __init__(self, resume_jobs: bool = True):
+        """resume_jobs: 前回終わらなかった生成ジョブを聞く (多重起動の 2 つ目以降は聞かない。同じジョブを二重に流さないため)。"""
         super().__init__()
         self.setWindowTitle("PromptWordCrafter")
 
@@ -75,6 +85,9 @@ class MainWindow(QMainWindow):
         self._tree_selection_guard = False
         self._suppress_tree_scroll = False
         self._scan_document = QTextDocument(self)
+        self._organizing: Optional[tuple] = None  # 項目整理中の (ファイル, 元の本文)
+        self._file_busy = False  # コピー・移動の最中
+        self._translating_file: Optional[tuple] = None  # 翻訳して書き出している (元のファイル, 訳す先)
 
         self.scan_timer = QTimer(self)
         self.scan_timer.setSingleShot(True)
@@ -87,8 +100,10 @@ class MainWindow(QMainWindow):
         self._connect_signals()
 
         self.load_folder(confirm=False)
-        # 前回終わらなかった生成ジョブは、ウィンドウが出てから聞く
-        QTimer.singleShot(0, self.generation.offer_resume)
+        # 前回終わらなかった生成ジョブは、ウィンドウが出てから聞く。2 つ目以降の窓は聞かない
+        # (聞かないあいだは GenerationController がジョブのファイルを書かないので、1 つ目のものを消さない)
+        if resume_jobs:
+            QTimer.singleShot(0, self.generation.offer_resume)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -162,6 +177,27 @@ class MainWindow(QMainWindow):
         bulk_bar.addWidget(self.delete_bak_button)
         self.reformat_button = QPushButton("文字列成型")
         bulk_bar.addWidget(self.reformat_button)
+        # 項目整理 (AI): 本文を [登場人物] [衣装] … に分けて書き直す。空なら項目名だけを入れる
+        self.organize_button = QPushButton("項目整理")
+        self.organize_button.setToolTip(
+            "編集欄の本文を AI で項目ごと ([登場人物] [衣装] [ポーズ・動作] [背景・小道具] [構図] [照明・画風] など) "
+            "に分けて書き直します (Ctrl+Z で戻せます)。\n"
+            "どれにも当てはまらない内容は、AI が内容から項目名を作ってまとめます。\n"
+            "本文が空のときは、項目名だけを入れます (書き足して使います)。\n"
+            "AI の接続とモデルは「盛る」と同じもの (エンハンサーの設定) を使います。"
+        )
+        bulk_bar.addWidget(self.organize_button)
+        self.organize_limit = token_limit_spin(self.settings_data.get("organize_limit", 0), "項目整理")
+        bulk_bar.addWidget(self.organize_limit)
+        # 翻訳して書き出す (AI): 表示中の本文を訳して、同じフォルダの「名前_en.txt」/「名前_ja.txt」に
+        self.translate_file_button = QPushButton("翻訳して書き出す")
+        self.translate_file_button.setToolTip(
+            "表示中のテキストの本文 (保存前の編集も含む) を AI で訳して、同じフォルダの別のファイル "
+            "(「名前_en.txt」/「名前_ja.txt」。あれば「名前_en (1).txt」…) に書き出します。元のファイルは変えません。\n"
+            "訳す向きは翻訳の小窓と同じ (ふだんは自動。小窓の「日本語に」「英語に」を押してあればその向き)。\n"
+            "接続先とモデルは「翻訳の設定」のものを使います。"
+        )
+        bulk_bar.addWidget(self.translate_file_button)
         bulk_bar.addStretch(1)
 
         # 生成は下の「生成 (PrismLab のレシピ)」の段だけ (2026-11-22 利用者の決定: 生成の設定は PrismLab に寄せ、
@@ -232,9 +268,11 @@ class MainWindow(QMainWindow):
             self.text_edit,
             lambda: self.current_path.name if self.current_path else "",
             self,
+            limit=self.settings_data.get("enhance_limit", 0),
         )
         enhance_bar.addWidget(self.enhancer.combo)
         enhance_bar.addWidget(self.enhancer.enhance_button)
+        enhance_bar.addWidget(self.enhancer.limit_spin)
         enhance_bar.addWidget(self.enhancer.settings_button)
 
         splitter.setStretchFactor(0, 1)
@@ -242,7 +280,19 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(2, 4)
         root_layout.addWidget(splitter, 1)
 
+        # 編集欄の本文のおおよそのトークン数 (ステータスバーの右端)
+        self.token_label = QLabel()
+        self.token_label.setToolTip("編集欄の本文のおおよそのトークン数 (LLM・T5 系の目安。モデルによって違います)")
+        self.statusBar().addPermanentWidget(self.token_label)
+        self.token_timer = QTimer(self)
+        self.token_timer.setSingleShot(True)
+        self.token_timer.timeout.connect(self.update_token_count)
+        self.update_token_count()
+
         self.statusBar().showMessage("フォルダを選択してください。")
+
+    def update_token_count(self):
+        self.token_label.setText(tokens.label(self.text_edit.toPlainText()))
 
     def _restore_window_geometry(self):
         self.setMinimumSize(MIN_WIDTH, MIN_HEIGHT)
@@ -280,6 +330,25 @@ class MainWindow(QMainWindow):
         self.remove_text_button.clicked.connect(self.open_remove_text_dialog)
         self.delete_bak_button.clicked.connect(self.remove_bak_files)
         self.reformat_button.clicked.connect(self.reformat_current_file)
+        self.organize_button.clicked.connect(self.organize_current_text)
+        self.translate_file_button.clicked.connect(self.translate_to_file)
+        self._translated_file.connect(self._on_translated_file, Qt.ConnectionType.QueuedConnection)
+        # エクスプローラーと同じ Ctrl+C / Ctrl+X / Ctrl+V (ファイル一覧にフォーカスがあるとき。編集欄では文字のコピー)
+        for key, slot in (("Ctrl+C", lambda: self.copy_to_clipboard(self._file_targets(), cut=False)),
+                          ("Ctrl+X", lambda: self.copy_to_clipboard(self._file_targets(), cut=True)),
+                          ("Ctrl+V", lambda: self.paste_files())):
+            shortcut = QShortcut(QKeySequence(key), self.file_list)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.setAutoRepeat(False)
+            shortcut.activated.connect(slot)
+        self._organized.connect(self._on_organized, Qt.ConnectionType.QueuedConnection)
+        self._transferred.connect(self._on_transferred, Qt.ConnectionType.QueuedConnection)
+        self.text_edit.textChanged.connect(lambda: self.token_timer.start(200))
+        # Del: ファイル一覧にフォーカスがあるときだけ (編集欄の Del は文字を消すので)
+        delete_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.file_list)
+        delete_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        delete_shortcut.setAutoRepeat(False)  # 押しっぱなしで続けて消えないように
+        delete_shortcut.activated.connect(lambda: self.delete_files(self._file_targets()))
 
         self.folder_tree.customContextMenuRequested.connect(self.show_folder_menu)
 
@@ -305,11 +374,18 @@ class MainWindow(QMainWindow):
             "window_y": geo.y(),
             "window_width": geo.width(),
             "window_height": geo.height(),
+            "organize_limit": self.organize_limit.value(),
+            "enhance_limit": self.enhancer.limit_spin.value(),
+            "transfer_dest": self.settings_data.get("transfer_dest", ""),
+            "transfer_conflict": self.settings_data.get("transfer_conflict", file_ops.RENAME),
             **self.translation.settings(),
         }
         settings_module.save_settings(data)
 
     def closeEvent(self, event):
+        if self._file_busy:
+            event.ignore()  # コピー・移動の途中では閉じない
+            return
         if not self.confirm_save_changes() or not self.generation.confirm_close():
             event.ignore()
             return
@@ -959,14 +1035,321 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("成型の必要な箇所はありませんでした。")
             return
 
+        self._replace_editor_text(new_text)
+        self.statusBar().showMessage("文字列を成型しました（Ctrl+Zで元に戻せます）。内容を確認して保存してください。")
+
+    def _replace_editor_text(self, new_text: str):
+        """編集欄の本文を丸ごと置き換える (Ctrl+Z で 1 回で戻せるように)。"""
         cursor = self.text_edit.textCursor()
         cursor.beginEditBlock()
         cursor.select(QTextCursor.SelectionType.Document)
         cursor.insertText(new_text)
         cursor.endEditBlock()
-
         self.text_edit.document().setModified(True)
-        self.statusBar().showMessage("文字列を成型しました（Ctrl+Zで元に戻せます）。内容を確認して保存してください。")
+
+    # ------------------------------------------------------------------
+    # 項目整理 (AI)
+    # ------------------------------------------------------------------
+    def organize_current_text(self):
+        if self._organizing is not None:
+            return
+        text = self.text_edit.toPlainText()
+        if not text.strip():
+            # 空のときは AI を使わず、項目名だけを入れる。最初の項目の下にカーソルを置く
+            body = organizer.template()
+            self._replace_editor_text(body)
+            cursor = self.text_edit.textCursor()
+            cursor.setPosition(body.index("\n") + 1)
+            self.text_edit.setTextCursor(cursor)
+            self.text_edit.setFocus()
+            self.statusBar().showMessage("項目名を入れました。各項目の下に書き足してください（Ctrl+Zで元に戻せます）。")
+            return
+        self._organizing = (self.current_path, text)
+        self.organize_button.setEnabled(False)
+        self.organize_button.setText("整理中...")
+        self.statusBar().showMessage("AI が本文を項目ごとに整理しています...")
+        limit = self.organize_limit.value()
+        llm.run_in_thread(lambda: organizer.organize(text, limit), self._organized)
+
+    def _on_organized(self, result, error):
+        path, original = self._organizing
+        self._organizing = None
+        self.organize_button.setEnabled(True)
+        self.organize_button.setText("項目整理")
+        if error is not None:
+            self.statusBar().showMessage("項目整理: 整理できませんでした。")
+            QMessageBox.warning(self, "項目整理", f"整理できませんでした。\n\n{error}")
+            return
+        new_text, cut = result
+        if self.current_path != path or self.text_edit.toPlainText() != original:
+            QApplication.clipboard().setText(new_text)
+            self.statusBar().showMessage(
+                "項目整理: 整理している間に表示中の本文が変わったので、編集欄には入れませんでした (結果はクリップボードにコピーしました)。"
+            )
+            return
+        self._replace_editor_text(new_text)
+        message = f"項目ごとに整理しました ({tokens.label(new_text)})。Ctrl+Zで元に戻せます。内容を確認して保存してください。"
+        if cut:
+            message = (f"項目ごとに整理しましたが、長さの上限で打ち切られました ({tokens.label(new_text)})。"
+                       "最後が途中で切れていないか確かめてください (Ctrl+Zで元に戻せます)。")
+        self.statusBar().showMessage(message)
+
+    # ------------------------------------------------------------------
+    # テキストの削除・コピー・移動 (生成結果も一緒に。file_ops)
+    # ------------------------------------------------------------------
+    def _file_targets(self) -> list[Path]:
+        """削除・コピー・移動の対象: 選択中のすべて (なければ表示中のもの)。"""
+        return self.selected_files() or ([self.current_path] if self.current_path is not None else [])
+
+    def _editing_one_of(self, paths: list[Path]) -> bool:
+        return (self.current_path is not None and self.text_edit.document().isModified()
+                and any(results.same_path(p, self.current_path) for p in paths))
+
+    def _remove_from_list(self, gone: list[Path]):
+        """消した・移したテキストを一覧から外す。表示中のものなら、同じ位置 (= 次) のものを表示する。"""
+        keys = {os.path.normcase(os.path.abspath(str(p))) for p in gone}
+        current_gone = self.current_path is not None and os.path.normcase(os.path.abspath(str(self.current_path))) in keys
+        first_row = None
+        self._restoring_selection = True
+        try:
+            for row in reversed(range(len(self.files))):
+                if os.path.normcase(os.path.abspath(str(self.files[row]))) in keys:
+                    first_row = row
+                    self.files.pop(row)
+                    self.file_list.takeItem(row)
+        finally:
+            self._restoring_selection = False
+        if not current_gone:
+            self.select_current_file()
+            return
+        self.current_path = None
+        self.text_edit.clear()
+        self.text_edit.document().setModified(False)
+        self.results_strip.clear()
+        self.translation.clear()
+        if self.files:
+            row = min(first_row or 0, len(self.files) - 1)
+            self._restoring_selection = True
+            try:
+                self.file_list.clearSelection()
+                self.file_list.setCurrentRow(row)
+            finally:
+                self._restoring_selection = False
+            self.open_file(row)
+            self.file_list.setFocus()
+
+    def _insert_file(self, path: Path):
+        """今のフォルダに出来たテキストを、一覧の名前順の位置に足す (読み直さないので、表示中の編集はそのまま)。"""
+        if any(results.same_path(p, path) for p in self.files) or not text_io.is_text_file(path):
+            return
+        row = next((i for i, p in enumerate(self.files) if p.name.lower() > path.name.lower()), len(self.files))
+        self.files.insert(row, path)
+        item = QListWidgetItem(path.name)
+        item.setData(Qt.ItemDataRole.UserRole, str(path))
+        item.setSizeHint(QSize(0, self.file_list.fontMetrics().height() + 2))
+        self._restoring_selection = True
+        try:
+            self.file_list.insertItem(row, item)
+        finally:
+            self._restoring_selection = False
+
+    def _select_files(self, paths: list[Path]):
+        """paths を選んだ状態にする (表示中のものは変えない)。"""
+        self._restoring_selection = True
+        try:
+            self.file_list.clearSelection()
+            for row, p in enumerate(self.files):
+                if any(results.same_path(p, q) for q in paths):
+                    self.file_list.item(row).setSelected(True)
+                    self.file_list.scrollToItem(self.file_list.item(row))
+        finally:
+            self._restoring_selection = False
+
+    # ------------------------------------------------------------------
+    # 翻訳して書き出す (AI。2026-11-26): 表示中の本文を訳して、同じフォルダの別のファイルにする
+    # ------------------------------------------------------------------
+    def translate_to_file(self):
+        if self._translating_file is not None:
+            return
+        if self.current_path is None:
+            QMessageBox.information(self, "翻訳して書き出す", "訳すファイルを選択してください。")
+            return
+        text = self.text_edit.toPlainText()  # 保存前の編集も含む
+        if not text.strip():
+            self.statusBar().showMessage("翻訳して書き出す: 本文が空です。")
+            return
+        # 訳す向きは翻訳の小窓と同じ (自動 / 日本語に / 英語に)
+        target = translation_core.resolve_target(text, self.translation.target)
+        self._translating_file = (self.current_path, target)
+        self.translate_file_button.setEnabled(False)
+        self.translate_file_button.setText("翻訳中...")
+        self.statusBar().showMessage(f"{self.current_path.name} を{translation_core.TARGET_NAMES[target]}に訳しています...")
+        base_url, model = self.translation.base_url, self.translation.model
+        llm.run_in_thread(lambda: translation_core.translate(base_url, model, text, target), self._translated_file)
+
+    def _on_translated_file(self, result, error):
+        source, target = self._translating_file
+        self._translating_file = None
+        self.translate_file_button.setEnabled(True)
+        self.translate_file_button.setText("翻訳して書き出す")
+        if error is not None:
+            self.statusBar().showMessage("翻訳して書き出す: 訳せませんでした。")
+            QMessageBox.warning(self, "翻訳して書き出す", f"訳せませんでした。\n\n{error}")
+            return
+        out = file_ops.translated_path(source, target)
+        try:
+            out.write_text((result or "").rstrip() + "\n", encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "翻訳して書き出す", f"書き出せませんでした。\n\n{exc}")
+            return
+        if results.same_path(out.parent, Path(self.folder_edit.text()).expanduser()):
+            self._insert_file(out)  # 表示はそのまま (訳を見るときは一覧で選ぶ)
+        self.statusBar().showMessage(
+            f"{source.name} を{translation_core.TARGET_NAMES[target]}に訳して {out.name} に書き出しました ({tokens.label(result or '')})。"
+        )
+
+    def delete_files(self, targets: list[Path]):
+        """ごみ箱へ (生成結果・説明の .txt・.bak も)。1 件は確認なし、複数・ごみ箱に入らない・編集中は確認する。"""
+        targets = [p for p in targets if p is not None]
+        if not targets or self._file_busy:
+            return
+        paths, result_paths = file_ops.delete_targets(targets)
+        recyclable = all(results.can_recycle(p) for p in paths)
+        editing = self._editing_one_of(targets)
+        if len(targets) > 1 or not recyclable or editing:
+            what = targets[0].name if len(targets) == 1 else f"選択中の {len(targets)} 件のテキスト"
+            text = f"{what}を削除 (ごみ箱へ) しますか？"
+            if not recyclable:
+                text = f"{what}を削除しますか？\n\nこの場所のファイルはごみ箱に入らず、完全に消えます。"
+            if result_paths:
+                text += f"\n\nそのテキストから生成した結果 {len(result_paths)} 個も一緒に削除します。"
+            if editing:
+                text += "\n\n表示中のテキストの、保存していない編集は失われます。"
+            if QMessageBox.question(self, "ファイルを削除", text) != QMessageBox.StandardButton.Yes:
+                return
+        if self.current_path is not None and any(results.same_path(p, self.current_path) for p in targets):
+            self.results_strip.clear()  # 再生中の動画などを手放してから消す
+        error = results.send_to_recycle_bin(paths)
+        gone = [p for p in targets if not p.exists()]
+        gone_results = sum(1 for p in result_paths if not p.exists())
+        if gone and self.current_path is not None and any(results.same_path(p, self.current_path) for p in gone):
+            self.text_edit.document().setModified(False)  # 消したので、保存するかは聞かない
+        self._remove_from_list(gone)
+        if error and not gone:
+            self.statusBar().showMessage(error)
+            return
+        where = "ごみ箱へ送りました" if recyclable else "削除しました"
+        what = f"{gone[0].name} " if len(gone) == 1 else f"{len(gone)} 件のテキスト"
+        message = f"{what}を{where}" + (f" (生成結果 {gone_results} 個も)。" if gone_results else "。")
+        if error:
+            message += f" {error}"
+        self.statusBar().showMessage(message)
+
+    def transfer_files(self, targets: list[Path], move: bool):
+        """コピー / 移動 (生成結果も行き先の「生成結果」フォルダへ)。行き先と同じ名前があるときの扱いはダイアログで選ぶ。"""
+        targets = [p for p in targets if p is not None]
+        if not targets or self._file_busy:
+            return
+        dialog = TransferDialog([p.name for p in targets], move, self.settings_data.get("transfer_dest", ""),
+                                self.settings_data.get("transfer_conflict", file_ops.RENAME), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        dest, conflict = dialog.dest(), dialog.conflict()
+        if results.same_path(dest, Path(self.folder_edit.text()).expanduser()):
+            QMessageBox.information(self, dialog.windowTitle(), "行き先が今のフォルダと同じです。")
+            return
+        self.settings_data["transfer_dest"] = str(dest)
+        self.settings_data["transfer_conflict"] = conflict
+        self._start_transfer(targets, dest, move, conflict)
+
+    # ---- エクスプローラーと同じコピー / 切り取り / 貼り付け ----
+    def copy_to_clipboard(self, targets: list[Path], cut: bool):
+        targets = [p for p in targets if p is not None]
+        if not targets:
+            return
+        if self._editing_one_of(targets) and not self.confirm_save_changes():
+            return  # 貼り付けたときに今の内容になるよう、先に保存する
+        QApplication.clipboard().setMimeData(file_ops.clipboard_data(targets, cut))
+        what = targets[0].name if len(targets) == 1 else f"{len(targets)} 件のテキスト"
+        self.statusBar().showMessage(f"{what}を{'切り取りました' if cut else 'コピーしました'}。貼り付ける場所で Ctrl+V。")
+
+    def _clipboard_texts(self) -> tuple[list[Path], bool]:
+        return file_ops.clipboard_files(QApplication.clipboard().mimeData())
+
+    def _add_paste_action(self, menu: QMenu, folder: Path, title: str):
+        paths, _cut = self._clipboard_texts()
+        action = menu.addAction(title + (f" ({len(paths)} 件)" if len(paths) > 1 else ""))
+        action.setEnabled(bool(paths) and not self._file_busy and folder.is_dir())
+        action.triggered.connect(lambda: self.paste_files(folder))
+
+    def paste_files(self, folder: Optional[Path] = None):
+        """クリップボードのテキスト (PWC やエクスプローラーでコピー / 切り取りしたもの) を folder (既定は今のフォルダ) に。
+
+        同じ名前があれば聞かずに「名前 (1).txt」にする (同じフォルダに貼れば複製になる)。生成結果も一緒に。"""
+        if self._file_busy:
+            return
+        folder = folder or Path(self.folder_edit.text()).expanduser()
+        paths, cut = self._clipboard_texts()
+        if not paths or not folder.is_dir():
+            return
+        if cut and all(results.same_path(p.parent, folder) for p in paths):
+            return  # 切り取って同じところに貼っても何もしない
+        if cut:
+            QApplication.clipboard().clear()  # 移したら、もう一度は貼れない (エクスプローラーと同じ)
+        self._start_transfer(paths, folder, cut, file_ops.PASTE)
+
+    def _start_transfer(self, targets: list[Path], dest: Path, move: bool, conflict: str):
+        if self._editing_one_of(targets) and not self.confirm_save_changes():
+            return  # 保存してから送る (編集中のものも今の内容で)
+        verb = "移動" if move else "コピー"
+        if move and self.current_path is not None and any(results.same_path(p, self.current_path) for p in targets):
+            self.results_strip.clear()  # 再生中の動画などを手放してから移す
+        self._file_busy = True
+        self._transfer_info = (move, dest)
+        self.centralWidget().setEnabled(False)  # 終わるまで操作できないようにする
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.statusBar().showMessage(f"{len(targets)} 件のテキストを{verb}しています...")
+        llm.run_in_thread(lambda: file_ops.transfer(targets, dest, move, conflict), self._transferred)
+
+    def _on_transferred(self, outcome, error):
+        move, dest = self._transfer_info
+        verb = "移動" if move else "コピー"
+        QApplication.restoreOverrideCursor()
+        self.centralWidget().setEnabled(True)
+        self._file_busy = False
+        self.save_settings()
+        if error is not None:
+            QMessageBox.critical(self, f"テキストを{verb}", f"{verb}できませんでした。\n\n{error}")
+            return
+        if move:
+            keep = self.current_path
+            self._remove_from_list([Path(p) for p in outcome.moved])
+            if self.current_path is not None and self.current_path == keep:
+                self.results_strip.show_for(keep, self.text_edit.toPlainText())  # 移す前に閉じていた帯を戻す
+        new_here = [Path(p) for p in outcome.moved.values()
+                    if results.same_path(Path(p).parent, Path(self.folder_edit.text()).expanduser())]
+        for path in new_here:
+            self._insert_file(path)  # 今のフォルダに貼り付けたもの (選んでおく)
+        if new_here:
+            self._select_files(new_here)
+        names = [Path(p).name for p in outcome.moved.values()]
+        where = f"「{dest}」へ" if not new_here else ""
+        if len(names) == 1:
+            message = f"{names[0]} を{where}{verb}しました" if where else f"{names[0]} を作りました ({verb})"
+        else:
+            message = f"{outcome.texts} 件のテキストを{where or 'このフォルダに'}{verb}しました"
+        message += f" (生成結果 {outcome.results} 個も)。" if outcome.results else "。"
+        self.statusBar().showMessage(message)
+        self.file_list.setFocus()
+        # スキップ・上書き・別名・失敗があったときだけ、終わってからまとめて知らせる
+        notes = []
+        for title, items in (("スキップしたもの", outcome.skipped), ("上書きしたもの", outcome.overwritten),
+                             ("別名で保存したもの", outcome.renamed), ("できなかったもの", outcome.errors)):
+            if items:
+                notes.append(f"{title} ({len(items)} 件):\n" + "\n".join(items[:20]) + ("\n…" if len(items) > 20 else ""))
+        if notes:
+            box = QMessageBox.warning if outcome.errors else QMessageBox.information
+            box(self, f"テキストを{verb}", message + "\n\n" + "\n\n".join(notes))
 
     # ------------------------------------------------------------------
     # 生成 (ComfyUI)
@@ -1020,6 +1403,7 @@ class MainWindow(QMainWindow):
         move = menu.addAction(f"このフォルダの生成結果を「{text_io.RESULTS_DIR}」フォルダへ移す...")
         move.triggered.connect(lambda: self.move_old_results(folder))
         menu.addSeparator()
+        self._add_paste_action(menu, folder, "このフォルダに貼り付け")
         explorer = menu.addAction("エクスプローラーで開く")
         explorer.triggered.connect(lambda: os.startfile(str(folder)))
         menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
@@ -1058,8 +1442,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
 
     def show_file_menu(self, pos):
-        """ファイル一覧の右クリックメニュー (生成 (ComfyUI) の操作)。ファイルがないときは出さない。"""
+        """ファイル一覧の右クリックメニュー。ファイルがないときは「貼り付け」だけ。"""
         if not self.files:
+            if self._clipboard_texts()[0]:
+                menu = QMenu(self)
+                self._add_paste_action(menu, Path(self.folder_edit.text()).expanduser(), "貼り付け\tCtrl+V")
+                menu.exec(self.file_list.viewport().mapToGlobal(pos))
             return
         item = self.file_list.itemAt(pos)
         clicked = Path(item.data(Qt.ItemDataRole.UserRole)) if item is not None else self.current_path
@@ -1075,6 +1463,31 @@ class MainWindow(QMainWindow):
         info.triggered.connect(lambda: self.generation.show_gen_info(clicked))
         menu.addSeparator()
         self._add_prismlab_menu(menu, selected)
+        # コピー・移動・削除: 選択中のすべて (なければ右クリックしたもの)
+        targets = selected or ([clicked] if clicked is not None else [])
+        unit = f"選択中の {len(targets)} 件を" if len(targets) > 1 else ""
+        menu.addSeparator()
+        # エクスプローラーと同じ: コピー / 切り取り → 貼り付け (同じ名前があれば「名前 (1).txt」)
+        copy = menu.addAction(f"{unit}コピー\tCtrl+C")
+        copy.setEnabled(bool(targets))
+        copy.triggered.connect(lambda: self.copy_to_clipboard(targets, cut=False))
+        cut = menu.addAction(f"{unit}切り取り\tCtrl+X")
+        cut.setEnabled(bool(targets))
+        cut.triggered.connect(lambda: self.copy_to_clipboard(targets, cut=True))
+        self._add_paste_action(menu, Path(self.folder_edit.text()).expanduser(), "貼り付け\tCtrl+V")
+        copy_to = menu.addAction(f"{unit}フォルダへコピー...")
+        copy_to.setEnabled(bool(targets) and not self._file_busy)
+        copy_to.triggered.connect(lambda: self.transfer_files(targets, move=False))
+        move_to = menu.addAction(f"{unit}フォルダへ移動...")
+        move_to.setEnabled(bool(targets) and not self._file_busy)
+        move_to.triggered.connect(lambda: self.transfer_files(targets, move=True))
+        explorer = menu.addAction("エクスプローラーで開く")
+        explorer.setEnabled(clicked is not None)
+        explorer.triggered.connect(lambda: results.show_in_explorer(clicked))
+        menu.addSeparator()
+        delete = menu.addAction(f"{unit or 'ファイルを'}削除 (ごみ箱へ)\tDel")
+        delete.setEnabled(bool(targets) and not self._file_busy)
+        delete.triggered.connect(lambda: self.delete_files(targets))
         menu.exec(self.file_list.viewport().mapToGlobal(pos))
 
     # ------------------------------------------------------------------

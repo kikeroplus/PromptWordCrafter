@@ -27,7 +27,9 @@ from PySide6.QtWidgets import (
 from gencommon import enhancer, llm, presets, settings
 from gencommon.presets import LlmPreset
 
+from . import tokens
 from .translation import COPIED_MS, check_icon, copy_icon
+from .widgets import token_limit_spin
 
 
 # ----------------------------------------------------------------------
@@ -148,7 +150,7 @@ class EnhancerController(QObject):
 
     _done = Signal(object, object)  # 結果, エラー文
 
-    def __init__(self, editor: QTextEdit, current_name: Callable[[], str], parent: QWidget):
+    def __init__(self, editor: QTextEdit, current_name: Callable[[], str], parent: QWidget, limit: int = 0):
         super().__init__(parent)
         self.parent_widget = parent
         self.editor = editor
@@ -166,6 +168,8 @@ class EnhancerController(QObject):
         self.combo.currentIndexChanged.connect(lambda i: presets.save_index(enhancer.PANEL_FILE, i))
         self.enhance_button = QPushButton("盛る")
         self.enhance_button.setToolTip("編集欄の今の内容を AI で書き足し、右上の小窓に出します (ファイルは変えません)")
+        # 盛った結果の長さの上限 (PWC の画面だけで効く。2026-11-26 利用者の決定)
+        self.limit_spin = token_limit_spin(limit, "盛る")
         self.settings_button = QPushButton("設定")  # グループ名が「エンハンサー (AI)」なので短く
         self.settings_button.setToolTip("エンハンサーの設定 (指示文の登録、LLM のサーバーURL とモデル)")
 
@@ -201,14 +205,17 @@ class EnhancerController(QObject):
         self.popup.show_message(self._title("盛っています...", preset), "AI が書き足しています...", waiting=True)
         base_url, model = settings.llm_url(), settings.enhance_model()
         self._running = preset
-        llm.run_in_thread(lambda: enhancer.enhance(base_url, model, preset, text), self._done)
+        limit = self.limit_spin.value()
+        llm.run_in_thread(lambda: enhance_limited(base_url, model, preset, text, limit), self._done)
 
     def _on_done(self, result, error):
         self._busy = False
         self.enhance_button.setEnabled(True)
         preset = self._running
         if error is None:
-            self.popup.show_message(self._title("盛ったプロンプト", preset), result or "")
+            text, cut = result
+            note = f" — {tokens.label(text)}" + (" (上限で打ち切り)" if cut else "")
+            self.popup.show_message(self._title("盛ったプロンプト", preset) + note, text)
         else:
             self.popup.show_message(self._title("盛れませんでした", preset), error, copyable=False)
 
@@ -219,3 +226,19 @@ class EnhancerController(QObject):
         # プリセットは窓の中で保存済み (キャンセルしても残る)。並び替えたら選んでいた番号も付いていく
         self.presets = enhancer.load_presets()
         presets.fill_combo(self.combo, self.presets, presets.load_index(enhancer.PANEL_FILE))
+
+
+def enhance_limited(base_url: str, model: str, preset: LlmPreset, text: str, limit: int) -> tuple[str, bool]:
+    """盛る (gencommon.enhancer.enhance と同じ)。limit (おおよそのトークン数) を指示に足し、返事もその長さで打ち切る。
+
+    戻り値: (盛ったプロンプト, 長さの上限で打ち切られたか)。
+    """
+    system, user = preset.system, enhancer.user_message(preset.template, text)
+    extra = tokens.instruction(limit)
+    if system.strip():
+        system += extra
+    elif extra:
+        user += extra  # 指示文がないエンハンサーは、送る文のあとに付ける
+    reply, cut = llm.chat_full(base_url, model, system, user, preset.temperature,
+                               max_tokens=tokens.cut_length(limit) or None)
+    return presets.clean(reply), cut

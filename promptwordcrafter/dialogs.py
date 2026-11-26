@@ -4,20 +4,23 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QPlainTextEdit,
+    QPushButton,
     QRadioButton,
     QSpinBox,
     QVBoxLayout,
 )
 
-from . import bulk_ops
+from . import bulk_ops, file_ops, text_io
 
 
 class RenameDialog(QDialog):
@@ -206,3 +209,61 @@ class RemoveTextDialog(QDialog):
 
     def text(self) -> str:
         return self.text_edit.text()
+
+
+class TransferDialog(QDialog):
+    """テキストをコピー / 移動する先のフォルダと、同じ名前があるときの扱いを選ぶ。"""
+
+    def __init__(self, names: list[str], move: bool, last_dest: str, conflict: str, parent=None):
+        super().__init__(parent)
+        verb = "移動" if move else "コピー"
+        self.setWindowTitle(f"テキストを{verb}")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+
+        what = names[0] if len(names) == 1 else f"選択中の {len(names)} 件のテキスト"
+        layout.addWidget(QLabel(
+            f"{what}を{verb}します。\n"
+            f"そのテキストから生成した結果 (画像・動画) も、行き先の「{text_io.RESULTS_DIR}」フォルダへ{verb}します。"
+        ))
+
+        form = QFormLayout()
+        dest_row = QHBoxLayout()
+        self.dest_edit = QLineEdit(last_dest)
+        self.dest_edit.setPlaceholderText("行き先のフォルダ (なければ作ります)")
+        dest_row.addWidget(self.dest_edit, 1)
+        browse = QPushButton("参照...")
+        browse.clicked.connect(self._browse)
+        dest_row.addWidget(browse)
+        form.addRow("行き先", dest_row)
+
+        self.conflict_combo = QComboBox()
+        for key in (file_ops.RENAME, file_ops.SKIP, file_ops.OVERWRITE):
+            self.conflict_combo.addItem(file_ops.CONFLICT_NAMES[key], key)
+        index = self.conflict_combo.findData(conflict)
+        self.conflict_combo.setCurrentIndex(max(index, 0))
+        self.conflict_combo.setToolTip("中身が同じものは、いつもスキップします")
+        form.addRow("同じ名前で中身が違うとき", self.conflict_combo)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(verb)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.dest_edit.setFocus()
+
+    def _browse(self):
+        folder = QFileDialog.getExistingDirectory(self, "行き先のフォルダ", self.dest_edit.text())
+        if folder:
+            self.dest_edit.setText(str(Path(folder)))
+
+    def _accept(self):
+        if self.dest_edit.text().strip():
+            self.accept()
+
+    def dest(self) -> Path:
+        return Path(self.dest_edit.text().strip()).expanduser()
+
+    def conflict(self) -> str:
+        return self.conflict_combo.currentData()
