@@ -267,3 +267,24 @@ class TransferDialog(QDialog):
 
     def conflict(self) -> str:
         return self.conflict_combo.currentData()
+
+
+class FileNameDialog(QDialog):
+    """1 件の名前の変更 (F2)。エクスプローラーと同じく、拡張子の前までを選んだ状態で開く。"""
+
+    def __init__(self, path: Path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("名前の変更")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("新しい名前:"))
+        self.name_edit = QLineEdit(path.name)
+        self.name_edit.setMinimumWidth(420)
+        self.name_edit.setSelection(0, len(path.stem))
+        layout.addWidget(self.name_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def name(self) -> str:
+        return self.name_edit.text().strip()

@@ -46,7 +46,7 @@ from . import results
 from . import settings as settings_module
 from . import text_io
 from . import tokens
-from .dialogs import AddTextDialog, NewFileDialog, RemoveTextDialog, RenameDialog, TransferDialog
+from .dialogs import AddTextDialog, FileNameDialog, NewFileDialog, RemoveTextDialog, RenameDialog, TransferDialog
 from .file_list import FileListWidget
 from .enhancer import EnhancerController
 from .highlighter import TagHighlighter
@@ -349,6 +349,11 @@ class MainWindow(QMainWindow):
         delete_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
         delete_shortcut.setAutoRepeat(False)  # 押しっぱなしで続けて消えないように
         delete_shortcut.activated.connect(lambda: self.delete_files(self._file_targets()))
+        # F2: 名前の変更 (2 件以上を選んでいるときは一括リネーム)
+        rename_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F2), self.file_list)
+        rename_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        rename_shortcut.setAutoRepeat(False)
+        rename_shortcut.activated.connect(self.rename_selected)
 
         self.folder_tree.customContextMenuRequested.connect(self.show_folder_menu)
 
@@ -906,6 +911,85 @@ class MainWindow(QMainWindow):
         renamed_count = len(plan)
         self.load_folder(confirm=False)
         message = f"{renamed_count} 件のファイル名を変更しました。"
+        if moved:
+            message += f" 生成結果 {moved} 件の名前も合わせました。"
+        if errors:
+            message += f" 生成結果の名前を変えられなかったもの: {len(errors)} 件"
+        self.statusBar().showMessage(message)
+
+    def rename_selected(self):
+        """F2: 1 件なら名前の変更、2 件以上を選んでいれば一括リネーム。"""
+        if self._file_busy:
+            return
+        targets = self._file_targets()
+        if len(targets) > 1:
+            self.open_rename_dialog()
+        elif targets:
+            self.rename_file(targets[0])
+
+    def rename_file(self, path: Path):
+        """1 件の名前の変更 (2026-11-26)。生成結果の名前・説明の .txt・.bak・生成の記録も合わせる。
+        本文は触らないので、表示中なら編集中の内容もそのまま (保存すると新しい名前に書く)。"""
+        if self._file_busy or not path.is_file():
+            return
+        dialog = FileNameDialog(path, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dialog.name()
+        if not name or name == path.name:
+            return
+        bad = set(name) & set('\\/:*?"<>|')
+        if bad or name.endswith(".") or name.endswith(" "):
+            QMessageBox.warning(self, "名前の変更",
+                                "ファイル名に使えない文字があります: " + " ".join(sorted(bad)) if bad
+                                else "名前の最後に「.」や空白は使えません。")
+            return
+        new_path = path.with_name(name)
+        if new_path.suffix.lower() not in text_io.TEXT_EXTENSIONS:
+            QMessageBox.warning(self, "名前の変更",
+                                f"拡張子「{new_path.suffix or '(なし)'}」では一覧に出なくなります。"
+                                f"{path.suffix} などのテキストの拡張子にしてください。")
+            return
+        if new_path.exists() and not results.same_path(new_path, path):
+            QMessageBox.warning(self, "名前の変更", f"{name} はもうあります。")
+            return
+        is_current = self.current_path is not None and results.same_path(path, self.current_path)
+        if is_current:
+            self.results_strip.clear()  # 再生中の動画などを手放してから名前を変える
+        try:
+            bulk_ops.apply_renames([(path, new_path)])
+        except OSError as exc:
+            QMessageBox.critical(self, "名前の変更", f"名前を変えられませんでした。\n\n{exc}")
+            if is_current:
+                self.results_strip.show_for(path, self.text_edit.toPlainText())
+            return
+        bak = path.with_suffix(path.suffix + ".bak")
+        if bak.is_file() and not new_path.with_suffix(new_path.suffix + ".bak").exists():
+            try:
+                bak.rename(new_path.with_suffix(new_path.suffix + ".bak"))
+            except OSError:
+                pass
+        moved, errors = results.rename_results([(path, new_path)])
+
+        # 一覧は読み直さず、その行だけ名前を変えて名前順の位置へ (表示中の編集はそのまま)
+        selected = [p for p in self.selected_files() if not results.same_path(p, path)]
+        self._restoring_selection = True
+        try:
+            for row in reversed(range(len(self.files))):
+                if results.same_path(self.files[row], path):
+                    self.files.pop(row)
+                    self.file_list.takeItem(row)
+        finally:
+            self._restoring_selection = False
+        self._insert_file(new_path)
+        if is_current:
+            self.current_path = new_path
+            self.results_strip.show_for(new_path, self.text_edit.toPlainText())
+            self.select_current_file()
+        else:
+            self._select_files(selected + [new_path])
+        self.file_list.setFocus()
+        message = f"{path.name} → {new_path.name} に名前を変えました。"
         if moved:
             message += f" 生成結果 {moved} 件の名前も合わせました。"
         if errors:
@@ -1485,6 +1569,13 @@ class MainWindow(QMainWindow):
         explorer.setEnabled(clicked is not None)
         explorer.triggered.connect(lambda: results.show_in_explorer(clicked))
         menu.addSeparator()
+        if len(targets) > 1:
+            rename = menu.addAction(f"{unit}一括リネーム...\tF2")
+            rename.triggered.connect(self.open_rename_dialog)
+        else:
+            rename = menu.addAction("名前の変更...\tF2")
+            rename.triggered.connect(lambda: self.rename_file(targets[0]))
+        rename.setEnabled(bool(targets) and not self._file_busy)
         delete = menu.addAction(f"{unit or 'ファイルを'}削除 (ごみ箱へ)\tDel")
         delete.setEnabled(bool(targets) and not self._file_busy)
         delete.triggered.connect(lambda: self.delete_files(targets))
