@@ -38,6 +38,7 @@ from gencommon import translation as translation_core
 from gencommon.generation import GenerationController
 from gencommon.recipe_panel import RecipePanel
 
+from . import ai_edit
 from . import bulk_ops
 from . import file_ops
 from . import organizer
@@ -68,6 +69,7 @@ SCAN_DEBOUNCE_MS = 250
 
 class MainWindow(QMainWindow):
     _organized = Signal(object, object)  # 項目整理の (結果, エラー文)
+    _ai_edited = Signal(object, object)  # AI に指示の (結果, エラー文)
     _transferred = Signal(object, object)  # コピー・移動の (結果, エラー文)
     _translated_file = Signal(object, object)  # 翻訳して書き出すの (訳, エラー文)
 
@@ -86,6 +88,7 @@ class MainWindow(QMainWindow):
         self._suppress_tree_scroll = False
         self._scan_document = QTextDocument(self)
         self._organizing: Optional[tuple] = None  # 項目整理中の (ファイル, 元の本文)
+        self._ai_editing: Optional[tuple] = None  # AI に指示で書き換え中の (ファイル, 元の本文, 指示)
         self._file_busy = False  # コピー・移動の最中
         self._translating_file: Optional[tuple] = None  # 翻訳して書き出している (元のファイル, 訳す先)
 
@@ -189,6 +192,15 @@ class MainWindow(QMainWindow):
         bulk_bar.addWidget(self.organize_button)
         self.organize_limit = token_limit_spin(self.settings_data.get("organize_limit", 0), "項目整理")
         bulk_bar.addWidget(self.organize_limit)
+        # AI に指示 (2026-11-27): 「背景を紅葉の森に」などの指示で、編集欄の本文を書き換える
+        self.ai_edit_button = QPushButton("AIに指示")
+        self.ai_edit_button.setToolTip(
+            "指示を入れる窓を出し、編集欄の本文を指示どおりに AI で書き換えます (Ctrl+Z で戻せます)。\n"
+            "例: 「このプロンプトの背景を紅葉の森に変えてください。」 AI の返事は書き換えたプロンプトだけを使います。\n"
+            "指示にないところは変えず、本文の言語 (英語なら英語) のまま書きます。\n"
+            "AI の接続とモデルは「盛る」と同じもの (エンハンサーの設定) を使います。"
+        )
+        bulk_bar.addWidget(self.ai_edit_button)
         # 翻訳して書き出す (AI): 表示中の本文を訳して、同じフォルダの「名前_en.txt」/「名前_ja.txt」に
         self.translate_file_button = QPushButton("翻訳して書き出す")
         self.translate_file_button.setToolTip(
@@ -331,6 +343,8 @@ class MainWindow(QMainWindow):
         self.delete_bak_button.clicked.connect(self.remove_bak_files)
         self.reformat_button.clicked.connect(self.reformat_current_file)
         self.organize_button.clicked.connect(self.organize_current_text)
+        self.ai_edit_button.clicked.connect(self.ai_edit_current_text)
+        self._ai_edited.connect(self._on_ai_edited, Qt.ConnectionType.QueuedConnection)
         self.translate_file_button.clicked.connect(self.translate_to_file)
         self._translated_file.connect(self._on_translated_file, Qt.ConnectionType.QueuedConnection)
         # エクスプローラーと同じ Ctrl+C / Ctrl+X / Ctrl+V (ファイル一覧にフォーカスがあるとき。編集欄では文字のコピー)
@@ -380,6 +394,7 @@ class MainWindow(QMainWindow):
             "window_width": geo.width(),
             "window_height": geo.height(),
             "organize_limit": self.organize_limit.value(),
+            "ai_edit_history": self.settings_data.get("ai_edit_history", []),
             "enhance_limit": self.enhancer.limit_spin.value(),
             "transfer_dest": self.settings_data.get("transfer_dest", ""),
             "transfer_conflict": self.settings_data.get("transfer_conflict", file_ops.RENAME),
@@ -1175,6 +1190,56 @@ class MainWindow(QMainWindow):
         message = f"項目ごとに整理しました ({tokens.label(new_text)})。Ctrl+Zで元に戻せます。内容を確認して保存してください。"
         if cut:
             message = (f"項目ごとに整理しましたが、長さの上限で打ち切られました ({tokens.label(new_text)})。"
+                       "最後が途中で切れていないか確かめてください (Ctrl+Zで元に戻せます)。")
+        self.statusBar().showMessage(message)
+
+    # ------------------------------------------------------------------
+    # AI に指示 (2026-11-27)
+    # ------------------------------------------------------------------
+    def ai_edit_current_text(self):
+        if self._ai_editing is not None:
+            return
+        text = self.text_edit.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "AI に指示", "編集欄が空です。書き換える本文を表示してから押してください。")
+            return
+        history = self.settings_data.get("ai_edit_history") or []
+        dialog = ai_edit.InstructionDialog(history if isinstance(history, list) else [], self)
+        if not dialog.exec():
+            return
+        instruction = dialog.instruction()
+        self.settings_data["ai_edit_history"] = ai_edit.add_history(history if isinstance(history, list) else [],
+                                                                    instruction)
+        text = self.text_edit.toPlainText()  # 窓を出しているあいだに直したものも
+        self._ai_editing = (self.current_path, text, instruction)
+        self.ai_edit_button.setEnabled(False)
+        self.ai_edit_button.setText("書き換え中...")
+        self.statusBar().showMessage("AI が指示どおりに本文を書き換えています...")
+        llm.run_in_thread(lambda: ai_edit.rewrite(text, instruction), self._ai_edited)
+
+    def _on_ai_edited(self, result, error):
+        path, original, _instruction = self._ai_editing
+        self._ai_editing = None
+        self.ai_edit_button.setEnabled(True)
+        self.ai_edit_button.setText("AIに指示")
+        if error is not None:
+            self.statusBar().showMessage("AI に指示: 書き換えられませんでした。")
+            QMessageBox.warning(self, "AI に指示", f"書き換えられませんでした。\n\n{error}")
+            return
+        new_text, cut = result
+        if self.current_path != path or self.text_edit.toPlainText() != original:
+            QApplication.clipboard().setText(new_text)
+            self.statusBar().showMessage(
+                "AI に指示: 書き換えている間に表示中の本文が変わったので、編集欄には入れませんでした (結果はクリップボードにコピーしました)。"
+            )
+            return
+        if new_text == original:
+            self.statusBar().showMessage("AI に指示: 本文は変わりませんでした。")
+            return
+        self._replace_editor_text(new_text)
+        message = f"指示どおりに書き換えました ({tokens.label(new_text)})。Ctrl+Zで元に戻せます。内容を確認して保存してください。"
+        if cut:
+            message = (f"書き換えましたが、AI の返事が長さの上限で打ち切られました ({tokens.label(new_text)})。"
                        "最後が途中で切れていないか確かめてください (Ctrl+Zで元に戻せます)。")
         self.statusBar().showMessage(message)
 
