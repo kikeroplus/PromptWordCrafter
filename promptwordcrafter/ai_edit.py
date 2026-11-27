@@ -20,27 +20,19 @@ from PySide6.QtWidgets import (
 
 from gencommon import llm, presets, settings
 
-from . import organizer
-
-TEMPERATURE = 0.3
+TEMPERATURE = 0.7  # チャットで頼むときと同じくらい (全体を書き直す指示もあるので、縛らない)
 HISTORY_MAX = 20
 
-SYSTEM = (
-    "You edit prompts for image and video generation models.\n"
-    "You receive a prompt and an instruction from the user. Rewrite the prompt so that it follows the instruction.\n"
-    "Rules:\n"
-    "- Change only what the instruction asks for. Keep everything else as it is: wording, order, details, "
-    "line breaks and section headers such as [背景・小道具].\n"
-    "- Keep weighting syntax such as (word:1.2), wildcards such as {a|b} and special tags such as <lora:...> "
-    "exactly as written, unless the instruction is about them.\n"
-    "- The instruction may be written in a different language from the prompt. Write your changes in the "
-    "language of the prompt, not of the instruction, unless the instruction asks for a language.\n"
-    "- Output only the whole rewritten prompt. No explanation, no notes, no quotes, no code block."
-)
+# 2026-11-27 利用者の希望: チャットで「下記のプロンプトを、…に書き直してください。プロンプトのみを出力してください。」
+# と頼んだときのように、全体を書き換えてよい。なので指示文 (system) は使わず、そのとおりの頼み方だけを送る
+# (前は「指示にないところは変えない」「本文の言語のまま」などで縛っていて、控えめにしか変わらなかった)。
 
 
 def user_message(text: str, instruction: str) -> str:
-    return f"Instruction:\n{instruction.strip()}\n\nPrompt:\n{text}"
+    return (f"下記のプロンプトを、次の指示どおりに書き直してください。\n"
+            f"指示: {instruction.strip()}\n"
+            f"プロンプトのみを出力してください。\n\n"
+            f"{text}")
 
 
 def rewrite(text: str, instruction: str, base_url: Optional[str] = None,
@@ -48,8 +40,7 @@ def rewrite(text: str, instruction: str, base_url: Optional[str] = None,
     """(書き換えた本文, 長さの上限で打ち切られたか)。返事が空なら llm.LLMError。"""
     base_url = base_url or settings.llm_url()
     model = model or settings.enhance_model()
-    system = SYSTEM + organizer.language_rule(text)
-    reply, cut = llm.chat_full(base_url, model, system, user_message(text, instruction), TEMPERATURE)
+    reply, cut = llm.chat_full(base_url, model, "", user_message(text, instruction), TEMPERATURE)
     result = presets.clean(reply)
     if not result.strip():
         raise llm.LLMError("AI の返事が空でした。もう一度試すか、モデルを替えてください。")
