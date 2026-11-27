@@ -231,6 +231,8 @@ class MainWindow(QMainWindow):
 
         # PrismLab のレシピ (2026-11-22): 台を選び、ファイルを選んでレシピを押すと PrismLab が裏で生成する
         self.recipe_panel = RecipePanel(self._recipe_sources, self)
+        # 生成する前に、編集中のテキストを保存する (PrismLab はファイルを読むので。2026-11-27 利用者の希望)
+        self.recipe_panel.before_start = self._save_before_send
         self.recipe_panel.status.connect(lambda text: self.statusBar().showMessage(text, 15000))
         self.recipe_panel.outputs_added.connect(self._refresh_results)
         root_layout.addWidget(self.recipe_panel)
