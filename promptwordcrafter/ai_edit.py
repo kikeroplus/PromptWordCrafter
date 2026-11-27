@@ -5,6 +5,7 @@ LLM の接続とモデルは「盛る」「項目整理」と同じもの (エ�
 最近の指示は設定 (promptwordcrafter_settings.json の ai_edit_history) に残し、窓で選び直せる。
 """
 
+import re
 from typing import Optional
 
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -31,8 +32,21 @@ HISTORY_MAX = 20
 def user_message(text: str, instruction: str) -> str:
     return (f"下記のプロンプトを、次の指示どおりに書き直してください。\n"
             f"指示: {instruction.strip()}\n"
-            f"プロンプトのみを出力してください。\n\n"
+            f"プロンプトのみを出力してください。Markdown の装飾 (** など) や見出し・説明は付けないでください。\n\n"
             f"{text}")
+
+
+# 返事の先頭の「**書き直したプロンプト:**」「Prompt:」のような見出しだけの行
+_LABEL_RE = re.compile(r"^[#>*_\s]*[^\n]{0,30}(プロンプト|prompt)[^\n]{0,10}?[:：]\s*[*_]*\s*$", re.IGNORECASE)
+
+
+def strip_markdown(text: str) -> str:
+    """モデルが付けてくる Markdown の太字 (**…**) と、先頭の見出しの行を外す (2026-11-27 利用者の指摘)。"""
+    text = text.replace("**", "")
+    lines = text.strip().split("\n")
+    if len(lines) > 1 and _LABEL_RE.match(lines[0]):
+        lines = lines[1:]
+    return "\n".join(lines).strip()
 
 
 def rewrite(text: str, instruction: str, base_url: Optional[str] = None,
@@ -41,7 +55,7 @@ def rewrite(text: str, instruction: str, base_url: Optional[str] = None,
     base_url = base_url or settings.llm_url()
     model = model or settings.enhance_model()
     reply, cut = llm.chat_full(base_url, model, "", user_message(text, instruction), TEMPERATURE)
-    result = presets.clean(reply)
+    result = presets.clean(strip_markdown(presets.clean(reply)))
     if not result.strip():
         raise llm.LLMError("AI の返事が空でした。もう一度試すか、モデルを替えてください。")
     if text.endswith("\n") and not result.endswith("\n"):
