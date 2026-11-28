@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidgetItem,
@@ -372,6 +373,17 @@ class MainWindow(QMainWindow):
         rename_shortcut.activated.connect(self.rename_selected)
 
         self.folder_tree.customContextMenuRequested.connect(self.show_folder_menu)
+        # テキストをツリーのフォルダへドラッグ: 移動 / コピー (エクスプローラーと同じ)
+        self.folder_tree.files_dropped.connect(self.drop_files_on_folder)
+        self.folder_tree.drop_hint.connect(lambda text: self.statusBar().showMessage(text) if text
+                                           else self.statusBar().clearMessage())
+        # 新しいフォルダー: Ctrl+Shift+N (エクスプローラーと同じ。ツリーかファイル一覧にフォーカスがあるとき。
+        # 右クリックしたフォルダではなく、今のフォルダの中に作る)
+        for widget in (self.folder_tree, self.file_list):
+            new_folder_shortcut = QShortcut(QKeySequence("Ctrl+Shift+N"), widget)
+            new_folder_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            new_folder_shortcut.setAutoRepeat(False)
+            new_folder_shortcut.activated.connect(lambda: self.create_folder(Path(self.folder_edit.text()).expanduser()))
 
         self.file_list.customContextMenuRequested.connect(self.show_file_menu)
         # 前の形で頼んで終わっていなかったジョブ (起動したときに続きから始める) の結果だけは受け取る
@@ -1449,6 +1461,68 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().clear()  # 移したら、もう一度は貼れない (エクスプローラーと同じ)
         self._start_transfer(paths, folder, cut, file_ops.PASTE)
 
+    def drop_files_on_folder(self, paths: list, folder: str, move: bool):
+        """ツリーのフォルダにテキストを落とした (この一覧からでも、エクスプローラーからでも)。
+
+        同じ名前があれば、貼り付けと同じく聞かずに「名前 (1).txt」にする。生成結果も一緒に。"""
+        if self._file_busy:
+            return
+        dest = Path(folder)
+        targets = [Path(p) for p in paths if not results.same_path(Path(p).parent, dest)]
+        if targets and dest.is_dir():
+            self._start_transfer(targets, dest, move, file_ops.PASTE)
+
+    def create_folder(self, parent: Path):
+        """parent の中に新しいフォルダーを作る (エクスプローラーと同じく「新しいフォルダー」「新しいフォルダー (2)」…)。
+
+        作ったあとも今のフォルダのまま (ツリーで作ったフォルダを見せる。テキストはドラッグや「フォルダへ移動」で入れる)。"""
+        if not parent.is_dir():
+            self.statusBar().showMessage(f"フォルダが見つかりません: {parent}")
+            return
+        base, i = "新しいフォルダー", 2
+        name = base
+        while (parent / name).exists():
+            name = f"{base} ({i})"
+            i += 1
+        while True:
+            name, ok = QInputDialog.getText(self, "新しいフォルダー", f"「{parent}」の中に作るフォルダーの名前:",
+                                            QLineEdit.EchoMode.Normal, name)
+            if not ok:
+                return
+            name = name.strip()
+            problem = file_ops.folder_name_problem(name)
+            if problem is None and (parent / name).exists():
+                problem = f"「{name}」はもうあります。"
+            if problem is None:
+                break
+            QMessageBox.warning(self, "新しいフォルダー", problem)
+        new = parent / name
+        try:
+            new.mkdir()
+        except OSError as exc:
+            QMessageBox.critical(self, "新しいフォルダー", "作れませんでした。" + chr(10) * 2 + str(exc))
+            return
+        self.statusBar().showMessage(f"フォルダー「{name}」を作りました: {new}")
+        self._show_in_tree(parent, new)
+
+    def _show_in_tree(self, parent: Path, folder: Path):
+        """ツリーで parent を開いて folder を見せる (選びはしない。選ぶとそのフォルダを開くので)。"""
+        parent_index = self.folder_tree_model.index(str(parent))
+        if parent_index.isValid():
+            self.folder_tree.expand(parent_index)
+
+        def reveal(tries=10):
+            index = self.folder_tree_model.index(str(folder))
+            if index.isValid():
+                h_scroll = self.folder_tree.horizontalScrollBar()
+                keep = h_scroll.value()
+                self.folder_tree.scrollTo(index)
+                h_scroll.setValue(keep)
+            elif tries:
+                QTimer.singleShot(150, lambda: reveal(tries - 1))  # ツリーが気付くまで少し待つ
+
+        QTimer.singleShot(100, reveal)
+
     def _start_transfer(self, targets: list[Path], dest: Path, move: bool, conflict: str):
         if self._editing_one_of(targets) and not self.confirm_save_changes():
             return  # 保存してから送る (編集中のものも今の内容で)
@@ -1554,6 +1628,8 @@ class MainWindow(QMainWindow):
         move = menu.addAction(f"このフォルダの生成結果を「{text_io.RESULTS_DIR}」フォルダへ移す...")
         move.triggered.connect(lambda: self.move_old_results(folder))
         menu.addSeparator()
+        new_folder = menu.addAction("新しいフォルダー...")
+        new_folder.triggered.connect(lambda: self.create_folder(folder))
         self._add_paste_action(menu, folder, "このフォルダに貼り付け")
         explorer = menu.addAction("エクスプローラーで開く")
         explorer.triggered.connect(lambda: os.startfile(str(folder)))
@@ -1593,11 +1669,14 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
 
     def show_file_menu(self, pos):
-        """ファイル一覧の右クリックメニュー。ファイルがないときは「貼り付け」だけ。"""
+        """ファイル一覧の右クリックメニュー。ファイルがないときは「貼り付け」「新しいフォルダー」だけ。"""
+        here = Path(self.folder_edit.text()).expanduser()
         if not self.files:
-            if self._clipboard_texts()[0]:
+            if here.is_dir():
                 menu = QMenu(self)
-                self._add_paste_action(menu, Path(self.folder_edit.text()).expanduser(), "貼り付け\tCtrl+V")
+                self._add_paste_action(menu, here, "貼り付け\tCtrl+V")
+                new_folder = menu.addAction("新しいフォルダー...\tCtrl+Shift+N")
+                new_folder.triggered.connect(lambda: self.create_folder(here))
                 menu.exec(self.file_list.viewport().mapToGlobal(pos))
             return
         item = self.file_list.itemAt(pos)
@@ -1632,6 +1711,8 @@ class MainWindow(QMainWindow):
         move_to = menu.addAction(f"{unit}フォルダへ移動...")
         move_to.setEnabled(bool(targets) and not self._file_busy)
         move_to.triggered.connect(lambda: self.transfer_files(targets, move=True))
+        new_folder = menu.addAction("新しいフォルダー...\tCtrl+Shift+N")
+        new_folder.triggered.connect(lambda: self.create_folder(here))
         explorer = menu.addAction("エクスプローラーで開く")
         explorer.setEnabled(clicked is not None)
         explorer.triggered.connect(lambda: results.show_in_explorer(clicked))

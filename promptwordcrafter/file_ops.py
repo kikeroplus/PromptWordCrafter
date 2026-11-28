@@ -201,6 +201,24 @@ def transfer(texts: list[Path], dest: Path, move: bool, conflict: str = RENAME) 
     return out
 
 
+_BAD_CHARS = '\\/:*?"<>|'
+_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def folder_name_problem(name: str) -> Optional[str]:
+    """Windows のフォルダー名に使えないときは、その理由 (使えるなら None)。"""
+    if not name:
+        return "名前を入れてください。"
+    bad = sorted({c for c in name if c in _BAD_CHARS or ord(c) < 32})
+    if bad:
+        return "次の文字は名前に使えません: " + " ".join(c if ord(c) >= 32 else "(制御文字)" for c in bad)
+    if name in (".", "..") or name.endswith("."):
+        return "名前の最後に「.」は付けられません。"
+    if name.split(".")[0].upper() in _RESERVED:
+        return f"「{name}」は Windows で使えない名前です。"
+    return None
+
+
 def translated_path(source: Path, target: str) -> Path:
     """翻訳を書き出すファイル: 同じフォルダの「名前_en.txt」/「名前_ja.txt」(あれば「名前_en (1).txt」…)。"""
     return _free_name(source.with_name(f"{source.stem}_{target}{source.suffix}"), set(), 1)

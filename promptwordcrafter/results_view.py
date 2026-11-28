@@ -1,6 +1,6 @@
 """編集欄の下の「生成結果」: 表示中のテキストから生成した画像・動画のサムネールを横一列に並べる。
 
-クリックで一覧の上に大きく表示 (もう一度クリック / Esc / 他の場所をクリックで閉じる。← → で切り替え)。
+カーソルを乗せると一覧の上に大きく表示 (PrismLab と同じ。離れる・押す・ホイール・キーで消える。動画は音なしで再生)。
 ダブルクリック / Enter で関連付けアプリで開く。右クリックで「生成時の設定」
 「エクスプローラーで開く」「PrismLab に送る」「ごみ箱へ削除」。他のアプリへドラッグするとファイルとして渡す (コピーのみ)。
 """
@@ -11,7 +11,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QItemSelectionModel, QMimeData, QObject, QPoint, QRect, QSize, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QImage, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -74,24 +74,34 @@ class _ThumbnailLoader(QObject):
 
 
 class _Preview(QWidget):
-    """クリックしたサムネールを一覧の上に大きく出す小窓。
+    """サムネールにカーソルを乗せると、一覧の上に大きく出す小窓 (PrismLab の量産ラインの「結果」と同じ出し方)。
 
-    フォーカスは取らない (キーは一覧のまま受ける)。小窓や一覧の外をクリックしたら閉じる。
+    乗せて少し待つと出し、離れる・押す・ホイール・キー・右クリック・ほかのウィンドウに移ると消す。
+    出ているあいだに隣へ移ったら、すぐ替える。動画は音なし・繰り返しで再生する。
+    窓はフォーカスを取らず、マウスも素通りさせる (一覧の操作を邪魔しない)。
     """
-
-    step_requested = Signal(int)  # ホイールで前 (-1) / 次 (+1)
 
     MARGIN = 6
     GAP = 8  # 画面の端・一覧との間
+    DELAY_MS = 300
+    CACHE = 8  # 読んだ大きな絵を覚えておく数 (隣と行き来しても読み直さない)
 
     def __init__(self, parent):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        # ToolTip の窓 (別の窓として出る。親を付けるのは、アプリを閉じたあとに消されて落ちないように)
+        super().__init__(parent, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowTransparentForInput)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.setStyleSheet("_Preview { background: #202020; border: 1px solid #555; }"
                            "QLabel { color: #e0e0e0; }")
-        self.path: Optional[str] = None
-        self._keep_clicks_on: Optional[QWidget] = None  # ここのクリックでは閉じない (一覧)
+        self.path: Optional[str] = None  # 出している (出そうとしている) ファイル
+        self._pending: Optional[tuple] = None  # 待っているあいだの (パス, 動画か, 一覧の範囲, 説明)
+        self._cache: dict = {}  # (パス, 更新日時, 幅, 高さ) → (絵, 元の大きさ)
+        self._player = None  # 動画を再生するもの (初めて動画に乗せたときに作る)
+        self._sink = None
+        self._playing = ""
+        self._size = QSize()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(self.MARGIN, self.MARGIN, self.MARGIN, self.MARGIN)
         layout.setSpacing(4)
@@ -101,35 +111,85 @@ class _Preview(QWidget):
         self.caption = QLabel()
         self.caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.caption)
-        QGuiApplication.instance().applicationStateChanged.connect(self._on_app_state)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(self.DELAY_MS)
+        self._timer.timeout.connect(self._show_pending)
 
-    def show_file(self, path: str, is_video: bool, anchor: QRect, keep_clicks_on: QWidget):
+    def hover(self, path: str, is_video: bool, anchor: QRect, note: str):
+        """path に乗った。出ていなければ少し待ってから、出ていればすぐ出す。"""
+        if path == self.path:
+            return
+        self.path = path
+        self._pending = (path, is_video, anchor, note)
+        if self.isVisible():
+            self._show_pending()
+        else:
+            self._timer.start()
+
+    def hide(self):
+        self._timer.stop()
+        self.path = None
+        self._pending = None
+        self._stop_video()
+        super().hide()
+
+    def forget(self, paths):
+        """消した・作り直したファイルの絵を忘れる。"""
+        keys = {str(p) for p in paths}
+        for key in [k for k in self._cache if k[0] in keys]:
+            del self._cache[key]
+
+    def _show_pending(self):
+        if self._pending is None:
+            return
+        path, is_video, anchor, note = self._pending
+        parent = self.parentWidget()
+        if parent is None or not parent.isVisible() or not parent.window().isActiveWindow():
+            return
+        if not self._show_file(path, is_video, anchor, note):
+            self.hide()
+
+    def _show_file(self, path: str, is_video: bool, anchor: QRect, note: str) -> bool:
         """path を anchor (一覧の画面上の範囲) の上に出す。上が狭ければ画面の中央に出す。"""
-        self._keep_clicks_on = keep_clicks_on
         screen = QGuiApplication.screenAt(anchor.center()) or self.screen()
         avail = screen.availableGeometry().adjusted(self.GAP, self.GAP, -self.GAP, -self.GAP)
         space = QRect(avail.left(), avail.top(), avail.width(), anchor.top() - self.GAP - avail.top())
         if space.height() < 320:
             space = avail
+        self.caption.setText(note)
         chrome_h = self.MARGIN * 2 + 4 + self.caption.sizeHint().height()
         width = space.width() - self.MARGIN * 2
         height = space.height() - chrome_h
         ratio = screen.devicePixelRatio()
-        image, original = results.load_preview(Path(path), int(width * ratio), int(height * ratio))
-        if image is None or image.isNull():
-            self.hide()
-            return
-        pixmap = QPixmap.fromImage(image)
-        pixmap.setDevicePixelRatio(ratio)
-        self.image.setPixmap(pixmap)
+        key = (path, results._mtime(Path(path)), int(width * ratio), int(height * ratio))
+        loaded = self._cache.get(key)
+        if loaded is None:
+            loaded = results.load_preview(Path(path), key[2], key[3])
+            if loaded[0] is None or loaded[0].isNull():
+                return False
+            self._cache[key] = loaded
+            while len(self._cache) > self.CACHE:
+                del self._cache[next(iter(self._cache))]
+        image, original = loaded
+        if not (is_video and self._playing == path):  # 再生が始まっていれば、コマのほうを出したままにする
+            pixmap = QPixmap.fromImage(image)
+            pixmap.setDevicePixelRatio(ratio)
+            self._size = QSize(round(image.width() / ratio), round(image.height() / ratio))
+            if is_video:  # 動画は、出せるいちばん大きな大きさに合わせる (コマはあとで同じ大きさに描く)
+                self._size = self._size.scaled(QSize(width, height), Qt.AspectRatioMode.KeepAspectRatio)
+                pixmap = pixmap.scaled(self._size * ratio, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
+                pixmap.setDevicePixelRatio(ratio)
+            self.image.setPixmap(pixmap)
         name = Path(path).name
         if is_video:
-            self.caption.setText(f"{name}    動画 (ダブルクリックで再生)")
+            head = f"▶ 動画 · {name}"
         elif original is not None:
-            self.caption.setText(f"{name}    {original.width()} × {original.height()}")
+            head = f"{name}    {original.width()} × {original.height()}"
         else:
-            self.caption.setText(name)
-        self.path = path
+            head = name
+        self.caption.setText(head + (f"\n{note}" if note else ""))
         self.adjustSize()
         size = self.sizeHint()
         x = min(max(anchor.center().x() - size.width() // 2, space.left()), space.right() - size.width() + 1)
@@ -140,35 +200,44 @@ class _Preview(QWidget):
         self.setGeometry(x, y, size.width(), size.height())
         self.show()
         self.raise_()
+        if is_video:
+            self._play(path)
+        else:
+            self._stop_video()
+        return True
 
-    def showEvent(self, event):
-        QApplication.instance().installEventFilter(self)
-        super().showEvent(event)
+    # ---- 動画 (PrismLab と同じく、コマは QVideoSink で受けて同じ欄に描く) ----
+    def _play(self, path: str):
+        if self._playing == path:
+            return
+        if self._player is None:
+            from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
+            self._player = QMediaPlayer(self)  # 音の出口を付けない = 音なし
+            self._sink = QVideoSink(self)
+            self._player.setVideoOutput(self._sink)
+            self._player.setLoops(QMediaPlayer.Loops.Infinite)
+            self._sink.videoFrameChanged.connect(self._frame)
+        self._playing = path
+        self._player.setSource(QUrl.fromLocalFile(path))
+        self._player.play()
 
-    def hideEvent(self, event):
-        QApplication.instance().removeEventFilter(self)
-        self.path = None
-        super().hideEvent(event)
+    def _stop_video(self):
+        if self._player is not None and self._playing:
+            self._playing = ""
+            self._player.stop()
+            self._player.setSource(QUrl())  # ファイルを手放す (削除・移動できるように)
 
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.MouseButtonPress and isinstance(obj, QWidget):
-            if obj is self or self.isAncestorOf(obj):
-                self.hide()
-                return True  # 小窓のクリックは閉じるだけ
-            keep = self._keep_clicks_on
-            if keep is None or not (obj is keep or keep.isAncestorOf(obj)):
-                self.hide()
-        return False
-
-    def wheelEvent(self, event):
-        delta = event.angleDelta().y() or event.angleDelta().x()
-        if delta:
-            self.step_requested.emit(-1 if delta > 0 else 1)
-        event.accept()
-
-    def _on_app_state(self, state):
-        if state != Qt.ApplicationState.ApplicationActive:
-            self.hide()
+    def _frame(self, frame):
+        if not self._playing or self._playing != self.path or not self.isVisible() or not frame.isValid():
+            return
+        image = frame.toImage()
+        if image.isNull():
+            return
+        ratio = self.devicePixelRatioF()
+        pixmap = QPixmap.fromImage(image).scaled(self._size * ratio, Qt.AspectRatioMode.KeepAspectRatio,
+                                                 Qt.TransformationMode.SmoothTransformation)
+        pixmap.setDevicePixelRatio(ratio)
+        self.image.setPixmap(pixmap)
 
 
 class _ResultList(QListWidget):
@@ -176,7 +245,6 @@ class _ResultList(QListWidget):
 
     open_requested = Signal()
     delete_requested = Signal()
-    clicked = Signal(object)  # 修飾キーなしの左クリック (ドラッグは除く) をした項目 (空きなら None)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -197,30 +265,6 @@ class _ResultList(QListWidget):
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.setFixedHeight(CELL_HEIGHT + self.horizontalScrollBar().sizeHint().height() + 6)
-        self._press: Optional[QPoint] = None
-        self.preview: Optional[_Preview] = None  # 出ていれば Esc で閉じる
-        self.shown_at_press: Optional[str] = None  # 押したときに小窓で表示していたもの
-
-    def mousePressEvent(self, event):
-        plain = not (event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier))
-        left = event.button() == Qt.MouseButton.LeftButton
-        self._press = event.position().toPoint() if left and plain else None
-        shown = self.preview is not None and self.preview.isVisible()
-        self.shown_at_press = self.preview.path if shown else None
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-        press, self._press = self._press, None
-        if press is None or event.button() != Qt.MouseButton.LeftButton:
-            return
-        if (event.position().toPoint() - press).manhattanLength() >= QApplication.startDragDistance():
-            return
-        self.clicked.emit(self.itemAt(press))
-
-    def mouseDoubleClickEvent(self, event):
-        self._press = None  # ダブルクリックの 2 回目の離しでは小窓を出さない
-        super().mouseDoubleClickEvent(event)
 
     def supportedDragActions(self) -> Qt.DropAction:
         return Qt.DropAction.CopyAction  # 移動させると一覧と食い違うのでコピーのみ
@@ -243,9 +287,6 @@ class _ResultList(QListWidget):
         if event.key() == Qt.Key.Key_Delete:
             if not event.isAutoRepeat():  # 押しっぱなしで続けて消えないように
                 self.delete_requested.emit()
-            return
-        if event.key() == Qt.Key.Key_Escape and self.preview is not None and self.preview.isVisible():
-            self.preview.hide()
             return
         super().keyPressEvent(event)
 
@@ -282,12 +323,11 @@ class ResultsStrip(QWidget):
 
         self._loader = _ThumbnailLoader()
         self._loader.loaded.connect(self._on_loaded, Qt.ConnectionType.QueuedConnection)
-        self._rebuilding = False
         self.preview = _Preview(self)
-        self.preview.step_requested.connect(self._step_preview)
-        self.list.preview = self.preview
-        self.list.clicked.connect(self._toggle_preview)
-        self.list.currentItemChanged.connect(self._follow_current)
+        # 乗せると大きく出す (PrismLab と同じ。2026-11-28 利用者の希望で、クリックで出すのをやめた)
+        self.list.viewport().setMouseTracking(True)
+        self.list.viewport().installEventFilter(self)
+        self.list.installEventFilter(self)
         self.list.itemDoubleClicked.connect(self._on_double_clicked)
         self.list.open_requested.connect(self._open_current)
         self.list.delete_requested.connect(self.delete_selected)
@@ -322,7 +362,7 @@ class ResultsStrip(QWidget):
         self.refresh_button.setEnabled(True)
 
         found = results.find_results(source, text)
-        self._rebuilding = True  # 作り直しの間に「表示中」が動いても小窓は追わない
+        self.preview.hide()  # 並びが変わるので、出している拡大は消す
         self.list.clear()
         self._items.clear()
         self._records = {str(r.path): r.record for r in found if r.record is not None}
@@ -334,7 +374,7 @@ class ResultsStrip(QWidget):
             item.setData(PATH_ROLE + 1, result.is_video)
             item.setData(PATH_ROLE + 2, result.old)
             item.setData(PATH_ROLE + 3, result.prismlab)
-            item.setToolTip(self._tooltip(result))
+            item.setData(PATH_ROLE + 4, self._note(result))  # 拡大の下に出す説明 (ツールチップは拡大と重ねない)
             item.setSizeHint(QSize(CELL_WIDTH, CELL_HEIGHT))
             image = self._images.get(self._cache_key(result.path))
             item.setIcon(self._icon(image, result.is_video, result.old, result.prismlab))
@@ -344,12 +384,6 @@ class ResultsStrip(QWidget):
                 item.setSelected(True)
             if image is None:
                 pending.append(path)
-        shown = self._items.get(self.preview.path) if same and self.preview.path else None
-        if shown is not None:
-            self.list.setCurrentItem(shown, QItemSelectionModel.SelectionFlag.NoUpdate)
-        else:
-            self.preview.hide()
-        self._rebuilding = False
         self.list.horizontalScrollBar().setValue(scroll)
 
         old = sum(1 for r in found if r.old)
@@ -367,8 +401,8 @@ class ResultsStrip(QWidget):
     def _cache_key(self, path: Path) -> str:
         return f"{results._key(path)}|{results._mtime(path)}"
 
-    def _tooltip(self, result: results.ResultFile) -> str:
-        lines = [str(result.path)]
+    def _note(self, result: results.ResultFile) -> str:
+        lines = [str(result.path.parent)]
         if result.prismlab and result.record is not None:
             req = result.record.request
             lines.append(f"PrismLab: {req.recipe or '(レシピ名なし)'}" + (f" ・ ステップ {req.step}" if req.step else ""))
@@ -381,7 +415,7 @@ class ResultsStrip(QWidget):
             lines.append("(生成の記録なし。ファイル名から見つけたもの)")
         if result.old:
             lines.append("※ 前の本文で生成したもの (今の本文とは違います)")
-        lines.append("クリックで大きく表示 / ダブルクリックで開く / 右クリックで生成時の設定")
+        lines.append("ダブルクリックで開く / 右クリックで生成時の設定")
         return "\n".join(lines)
 
     def _on_loaded(self, ticket: int, path: str, image: QImage):
@@ -440,36 +474,29 @@ class ResultsStrip(QWidget):
     def _selected_paths(self) -> list[Path]:
         return [Path(item.data(PATH_ROLE)) for item in self.list.selectedItems()]
 
-    def _show_preview(self, item: QListWidgetItem):
+    def eventFilter(self, obj, event):
+        kind = event.type()
+        if kind == QEvent.Type.MouseMove and obj is self.list.viewport():
+            if not event.buttons():  # ドラッグ中・押しているあいだは出さない
+                self._hovered(event.position().toPoint())
+        elif kind in (QEvent.Type.Leave, QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick,
+                      QEvent.Type.Wheel, QEvent.Type.KeyPress, QEvent.Type.Hide, QEvent.Type.WindowDeactivate,
+                      QEvent.Type.ContextMenu):
+            self.preview.hide()
+        return super().eventFilter(obj, event)
+
+    def _hovered(self, pos: QPoint):
+        item = self.list.itemAt(pos)
+        path = item.data(PATH_ROLE) if item is not None else None
+        if not path or not Path(path).exists():
+            self.preview.hide()
+            return
         anchor = QRect(self.list.mapToGlobal(QPoint(0, 0)), self.list.size())
         rect = self.list.visualItemRect(item)
         anchor.moveLeft(self.list.viewport().mapToGlobal(rect.center()).x() - anchor.width() // 2)
-        self.preview.show_file(item.data(PATH_ROLE), item.data(PATH_ROLE + 1), anchor, self.list.viewport())
-        if not self.preview.isVisible():
-            self.status.emit(f"表示できませんでした: {Path(item.data(PATH_ROLE)).name}")
-
-    def _toggle_preview(self, item: Optional[QListWidgetItem]):
-        """クリック: 大きく表示。表示中のものをもう一度クリックしたら (空きをクリックしても) 閉じる。"""
-        if item is None or self.list.shown_at_press == item.data(PATH_ROLE):
-            self.preview.hide()
-        elif not (self.preview.isVisible() and self.preview.path == item.data(PATH_ROLE)):
-            self._show_preview(item)  # 押したときに表示が移っていれば、そのまま
-
-    def _follow_current(self, current: Optional[QListWidgetItem], _previous=None):
-        """小窓が出ていれば、← → などで動いた先を表示する。"""
-        if self._rebuilding or current is None or not self.preview.isVisible():
-            return
-        if self.preview.path != current.data(PATH_ROLE):
-            self.list.scrollToItem(current)
-            self._show_preview(current)
-
-    def _step_preview(self, step: int):
-        row = self.list.currentRow() + step
-        if 0 <= row < self.list.count():
-            self.list.setCurrentRow(row)  # 選択も移す (_follow_current で表示が変わる)
+        self.preview.hover(path, bool(item.data(PATH_ROLE + 1)), anchor, item.data(PATH_ROLE + 4) or "")
 
     def _on_double_clicked(self, item: QListWidgetItem):
-        self.preview.hide()
         self._open(Path(item.data(PATH_ROLE)))
 
     def _open_current(self):
@@ -577,7 +604,6 @@ class ResultsStrip(QWidget):
         paths = self._selected_paths()
         if not paths:
             return
-        previewing = self.preview.isVisible()
         recyclable = all(results.can_recycle(p) for p in paths)
         if len(paths) > 1 or not recyclable:
             what = paths[0].name if len(paths) == 1 else f"選択中の {len(paths)} 個のファイル"
@@ -587,15 +613,15 @@ class ResultsStrip(QWidget):
             if QMessageBox.question(self, "ファイルを削除", text) != QMessageBox.StandardButton.Yes:
                 return
         first_row = min(self.list.row(item) for item in self.list.selectedItems())
+        self.preview.hide()  # 再生している動画を手放してから消す
         error = results.send_to_recycle_bin(paths)
+        self.preview.forget(paths)
         gone = [p for p in paths if not p.exists()]
         self.refresh()
         # 消したあとは、同じ位置 (= 次) のものを選ぶ
         if self.list.count():
             row = min(first_row, self.list.count() - 1)
             self.list.setCurrentRow(row)
-            if previewing and not self.preview.isVisible():
-                self._show_preview(self.list.currentItem())  # 大きく表示していたら、次のものを出す
         if error and len(gone) < len(paths):
             self.status.emit(f"{error}  (残った {len(paths) - len(gone)} 個 / ごみ箱へ移動 {len(gone)} 個)")
         elif len(gone) == 1:
